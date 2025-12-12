@@ -186,20 +186,60 @@ defmodule ReqLLM.Providers.Anthropic.Context do
     }
   end
 
+  # File with metadata - check for file_id first (Anthropic Files API)
+  defp encode_content_part(%ReqLLM.Message.ContentPart{
+         type: :file,
+         data: data,
+         media_type: media_type,
+         filename: _filename,
+         metadata: metadata
+       })
+       when is_map(metadata) do
+    # Check if file_id is present in metadata (uploaded to Anthropic Files API)
+    file_id = Map.get(metadata, :file_id) || Map.get(metadata, "file_id")
+
+    cond do
+      # Has file_id - reference uploaded file
+      file_id != nil ->
+        %{
+          type: "document",
+          source: %{
+            type: "file",
+            file_id: file_id
+          }
+        }
+
+      # Has data - encode as base64 (inline file)
+      data != nil ->
+        %{
+          type: "document",
+          source: %{
+            type: "base64",
+            media_type: media_type,
+            data: Base.encode64(data)
+          }
+        }
+
+      # No file_id and no data - skip this content part
+      true ->
+        nil
+    end
+  end
+
+  # File without metadata - fallback to base64 encoding
   defp encode_content_part(%ReqLLM.Message.ContentPart{
          type: :file,
          data: data,
          media_type: media_type,
          filename: _filename
-       }) do
-    base64 = Base.encode64(data)
-
+       })
+       when data != nil do
     %{
       type: "document",
       source: %{
         type: "base64",
         media_type: media_type,
-        data: base64
+        data: Base.encode64(data)
       }
     }
   end

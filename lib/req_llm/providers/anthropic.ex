@@ -364,6 +364,22 @@ defmodule ReqLLM.Providers.Anthropic do
         beta_features
       end
 
+    # Add context management beta if memory tools are present
+    beta_features =
+      if has_memory_tool?(opts) do
+        ["context-management-2025-06-27" | beta_features]
+      else
+        beta_features
+      end
+
+    # Add files API beta if explicitly enabled via provider_options
+    beta_features =
+      if has_files_api?(opts) do
+        ["files-api-2025-04-14" | beta_features]
+      else
+        beta_features
+      end
+
     case beta_features do
       [] ->
         []
@@ -479,6 +495,22 @@ defmodule ReqLLM.Providers.Anthropic do
         beta_features
       end
 
+    # Add context management beta if memory tools are present
+    beta_features =
+      if has_memory_tool?(user_opts) do
+        ["context-management-2025-06-27" | beta_features]
+      else
+        beta_features
+      end
+
+    # Add files API beta if explicitly enabled via provider_options
+    beta_features =
+      if has_files_api?(user_opts) do
+        ["files-api-2025-04-14" | beta_features]
+      else
+        beta_features
+      end
+
     case beta_features do
       [] ->
         request
@@ -510,6 +542,22 @@ defmodule ReqLLM.Providers.Anthropic do
   @doc false
   def has_prompt_caching?(opts) do
     get_option(opts, :anthropic_prompt_cache, false) == true
+  end
+
+  @doc false
+  def has_memory_tool?(user_opts) do
+    tools = Keyword.get(user_opts, :tools, [])
+
+    is_list(tools) and
+      Enum.any?(tools, fn tool ->
+        tool.tool_type == "memory_20250818"
+      end)
+  end
+
+  @doc false
+  def has_files_api?(user_opts) do
+    provider_options = Keyword.get(user_opts, :provider_options, [])
+    Keyword.get(provider_options, :files_api, false) == true
   end
 
   @doc false
@@ -645,15 +693,30 @@ defmodule ReqLLM.Providers.Anthropic do
   Convert a ReqLLM.Tool to Anthropic's tool format.
 
   This is made public so that Bedrock and Vertex formatters can reuse it.
+
+  For custom tool types (like memory_20250818), generates a minimal format
+  with just type and name.
   """
   def tool_to_anthropic_format(tool) do
-    schema = ReqLLM.Tool.to_schema(tool, :openai)
+    case tool.tool_type do
+      nil ->
+        # Standard function tool
+        schema = ReqLLM.Tool.to_schema(tool, :openai)
 
-    %{
-      name: schema["function"]["name"],
-      description: schema["function"]["description"],
-      input_schema: schema["function"]["parameters"]
-    }
+        %{
+          name: schema["function"]["name"],
+          description: schema["function"]["description"],
+          input_schema: schema["function"]["parameters"]
+        }
+
+      custom_type ->
+        # Custom tool type (e.g., memory_20250818)
+        # These tools only need type and name, no description or input_schema
+        %{
+          type: custom_type,
+          name: tool.name
+        }
+    end
   end
 
   @doc """
