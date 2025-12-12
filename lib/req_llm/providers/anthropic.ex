@@ -364,22 +364,6 @@ defmodule ReqLLM.Providers.Anthropic do
         beta_features
       end
 
-    # Add context management beta if memory tools are present
-    beta_features =
-      if has_memory_tool?(opts) do
-        ["context-management-2025-06-27" | beta_features]
-      else
-        beta_features
-      end
-
-    # Add files API beta if explicitly enabled via provider_options
-    beta_features =
-      if has_files_api?(opts) do
-        ["files-api-2025-04-14" | beta_features]
-      else
-        beta_features
-      end
-
     case beta_features do
       [] ->
         []
@@ -495,22 +479,6 @@ defmodule ReqLLM.Providers.Anthropic do
         beta_features
       end
 
-    # Add context management beta if memory tools are present
-    beta_features =
-      if has_memory_tool?(user_opts) do
-        ["context-management-2025-06-27" | beta_features]
-      else
-        beta_features
-      end
-
-    # Add files API beta if explicitly enabled via provider_options
-    beta_features =
-      if has_files_api?(user_opts) do
-        ["files-api-2025-04-14" | beta_features]
-      else
-        beta_features
-      end
-
     case beta_features do
       [] ->
         request
@@ -542,22 +510,6 @@ defmodule ReqLLM.Providers.Anthropic do
   @doc false
   def has_prompt_caching?(opts) do
     get_option(opts, :anthropic_prompt_cache, false) == true
-  end
-
-  @doc false
-  def has_memory_tool?(user_opts) do
-    tools = Keyword.get(user_opts, :tools, [])
-
-    is_list(tools) and
-      Enum.any?(tools, fn tool ->
-        tool.tool_type == "memory_20250818"
-      end)
-  end
-
-  @doc false
-  def has_files_api?(user_opts) do
-    provider_options = Keyword.get(user_opts, :provider_options, [])
-    Keyword.get(provider_options, :files_api, false) == true
   end
 
   @doc false
