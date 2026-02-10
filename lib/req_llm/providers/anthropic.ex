@@ -101,6 +101,10 @@ defmodule ReqLLM.Providers.Anthropic do
 
       Example: %{max_uses: 5, allowed_domains: ["example.com"]}
       """
+    ],
+    context_management: [
+      type: :map,
+      doc: "Context management configuration for tool result and thinking block clearing"
     ]
   ]
 
@@ -377,6 +381,7 @@ defmodule ReqLLM.Providers.Anthropic do
     |> maybe_add_tools(opts)
     |> maybe_apply_prompt_caching(opts)
     |> maybe_add_output_format(opts)
+    |> maybe_add_context_management(opts)
   end
 
   defp build_request_url(opts) do
@@ -1293,6 +1298,18 @@ defmodule ReqLLM.Providers.Anthropic do
     case output_format do
       nil -> body
       format -> Map.put(body, :output_format, format)
+    end
+  end
+
+  defp maybe_add_context_management(body, opts) do
+    context_management =
+      get_option(opts, :context_management) ||
+        get_option(get_option(opts, :provider_options, []), :context_management)
+
+    case context_management do
+      nil -> body
+      config when is_map(config) -> Map.put(body, :context_management, config)
+      _ -> body
     end
   end
 end
