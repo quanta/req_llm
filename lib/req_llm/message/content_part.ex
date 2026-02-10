@@ -15,7 +15,7 @@ defmodule ReqLLM.Message.ContentPart do
   """
 
   @schema Zoi.struct(__MODULE__, %{
-            type: Zoi.enum([:text, :image_url, :image, :file, :thinking]),
+            type: Zoi.enum([:text, :image_url, :image, :file, :thinking, :compaction]),
             text: Zoi.string() |> Zoi.nullable() |> Zoi.default(nil),
             url: Zoi.string() |> Zoi.nullable() |> Zoi.default(nil),
             data: Zoi.any() |> Zoi.nullable() |> Zoi.default(nil),
@@ -49,6 +49,9 @@ defmodule ReqLLM.Message.ContentPart do
   def thinking(content, metadata),
     do: %__MODULE__{type: :thinking, text: content, metadata: metadata}
 
+  @spec compaction(String.t()) :: t()
+  def compaction(content), do: %__MODULE__{type: :compaction, text: content}
+
   @spec image_url(String.t()) :: t()
   def image_url(url), do: %__MODULE__{type: :image_url, url: url}
 
@@ -76,6 +79,7 @@ defmodule ReqLLM.Message.ContentPart do
           :image_url -> "url: #{part.url}"
           :image -> "#{part.media_type} (#{byte_size(part.data)} bytes)"
           :file -> "#{part.media_type} (#{byte_size(part.data || <<>>)} bytes)"
+          :compaction -> inspect_text(part.text, opts)
         end
 
       Inspect.Algebra.concat([

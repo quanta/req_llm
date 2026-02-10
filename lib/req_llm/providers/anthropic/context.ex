@@ -266,6 +266,10 @@ defmodule ReqLLM.Providers.Anthropic.Context do
     }
   end
 
+  defp encode_content_part(%ReqLLM.Message.ContentPart{type: :compaction, text: text}) do
+    %{type: "compaction", content: text}
+  end
+
   defp encode_content_part(_), do: nil
 
   defp encode_tool_call_to_tool_use(%ToolCall{id: id, function: %{name: name, arguments: args}}) do

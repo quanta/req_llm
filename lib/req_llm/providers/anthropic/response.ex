@@ -161,6 +161,10 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     ReqLLM.StreamChunk.tool_call(name, input, %{id: id})
   end
 
+  defp decode_content_block(%{"type" => "compaction", "content" => content}) do
+    %ReqLLM.StreamChunk{type: :compaction, text: content}
+  end
+
   defp decode_content_block(_), do: nil
 
   defp decode_content_block_delta(%{"type" => "text_delta", "text" => text}, _index)
@@ -187,6 +191,11 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     [ReqLLM.StreamChunk.meta(%{tool_call_args: %{index: index, fragment: fragment}})]
   end
 
+  defp decode_content_block_delta(%{"type" => "compaction_delta", "content" => content}, _index)
+       when is_binary(content) do
+    [%ReqLLM.StreamChunk{type: :compaction, text: content}]
+  end
+
   defp decode_content_block_delta(_, _index), do: []
 
   defp decode_content_block_start(%{"type" => "text", "text" => text}, _index) do
@@ -206,6 +215,10 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     [ReqLLM.StreamChunk.tool_call(name, %{}, %{id: id, index: index, start: true})]
   end
 
+  defp decode_content_block_start(%{"type" => "compaction"}, _index) do
+    [%ReqLLM.StreamChunk{type: :compaction, text: ""}]
+  end
+
   defp decode_content_block_start(_, _index), do: []
 
   defp build_message_from_chunks([]), do: nil
@@ -213,7 +226,7 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   defp build_message_from_chunks(chunks) do
     content_parts =
       chunks
-      |> Enum.filter(&(&1.type in [:content, :thinking]))
+      |> Enum.filter(&(&1.type in [:content, :thinking, :compaction]))
       |> Enum.map(&chunk_to_content_part/1)
       |> Enum.reject(&is_nil/1)
 
@@ -261,6 +274,10 @@ defmodule ReqLLM.Providers.Anthropic.Response do
 
   defp chunk_to_content_part(%ReqLLM.StreamChunk{type: :thinking, text: text}) do
     %ReqLLM.Message.ContentPart{type: :thinking, text: text}
+  end
+
+  defp chunk_to_content_part(%ReqLLM.StreamChunk{type: :compaction, text: text}) do
+    %ReqLLM.Message.ContentPart{type: :compaction, text: text}
   end
 
   defp chunk_to_content_part(_), do: nil
@@ -329,6 +346,7 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   defp parse_finish_reason("tool_use"), do: :tool_calls
   defp parse_finish_reason("end_turn"), do: :stop
   defp parse_finish_reason("content_filter"), do: :content_filter
+  defp parse_finish_reason("compaction"), do: :compaction
   defp parse_finish_reason(reason) when is_binary(reason), do: :error
   defp parse_finish_reason(_), do: nil
 
