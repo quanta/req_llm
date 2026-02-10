@@ -993,7 +993,7 @@ defmodule ReqLLM.Context do
     Enum.flat_map(parts, fn
       %ContentPart{} = part -> [part]
       text when is_binary(text) -> [ContentPart.text(text)]
-      part -> [ContentPart.text(to_string(part))]
+      part -> [ContentPart.text(encode_tool_output(part))]
     end)
   end
 
