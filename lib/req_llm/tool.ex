@@ -73,7 +73,8 @@ defmodule ReqLLM.Tool do
             parameter_schema: Zoi.any() |> Zoi.default([]),
             compiled: Zoi.any() |> Zoi.default(nil),
             callback: Zoi.any() |> Zoi.required(),
-            strict: Zoi.boolean() |> Zoi.default(false)
+            strict: Zoi.boolean() |> Zoi.default(false),
+            tool_type: Zoi.string() |> Zoi.nullable() |> Zoi.default(nil)
           })
 
   @typedoc "A tool definition for AI model function calling"
@@ -118,6 +119,12 @@ defmodule ReqLLM.Tool do
                    type: :boolean,
                    default: false,
                    doc: "Enable strict mode for OpenAI structured outputs"
+                 ],
+                 tool_type: [
+                   type: {:custom, __MODULE__, :validate_tool_type, []},
+                   default: nil,
+                   doc:
+                     "Custom tool type (e.g., 'memory_20250818' for Anthropic memory tools)"
                  ]
                )
 
@@ -175,7 +182,8 @@ defmodule ReqLLM.Tool do
         parameter_schema: validated_opts[:parameter_schema],
         compiled: compiled_schema,
         callback: validated_opts[:callback],
-        strict: validated_opts[:strict] || false
+        strict: validated_opts[:strict] || false,
+        tool_type: validated_opts[:tool_type]
       }
 
       {:ok, tool}
@@ -342,6 +350,13 @@ defmodule ReqLLM.Tool do
   end
 
   def valid_name?(_), do: false
+
+  @doc false
+  def validate_tool_type(nil), do: {:ok, nil}
+  def validate_tool_type(value) when is_binary(value), do: {:ok, value}
+
+  def validate_tool_type(value),
+    do: {:error, "expected string or nil, got: #{inspect(value)}"}
 
   # Private functions
 

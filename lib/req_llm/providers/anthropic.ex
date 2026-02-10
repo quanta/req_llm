@@ -807,15 +807,30 @@ defmodule ReqLLM.Providers.Anthropic do
   Convert a ReqLLM.Tool to Anthropic's tool format.
 
   This is made public so that Bedrock and Vertex formatters can reuse it.
+
+  For custom tool types (like memory_20250818), generates a minimal format
+  with just type and name.
   """
   def tool_to_anthropic_format(tool) do
-    schema = ReqLLM.Tool.to_schema(tool, :openai)
+    case tool.tool_type do
+      nil ->
+        # Standard function tool
+        schema = ReqLLM.Tool.to_schema(tool, :openai)
 
-    %{
-      name: schema["function"]["name"],
-      description: schema["function"]["description"],
-      input_schema: schema["function"]["parameters"]
-    }
+        %{
+          name: schema["function"]["name"],
+          description: schema["function"]["description"],
+          input_schema: schema["function"]["parameters"]
+        }
+
+      custom_type ->
+        # Custom tool type (e.g., memory_20250818)
+        # These tools only need type and name, no description or input_schema
+        %{
+          type: custom_type,
+          name: tool.name
+        }
+    end
   end
 
   # Builds a web search tool definition for Anthropic API.
