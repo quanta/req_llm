@@ -270,6 +270,10 @@ defmodule ReqLLM.Providers.Anthropic.Context do
     %{type: "compaction", content: text}
   end
 
+  defp encode_content_part(%ReqLLM.Message.ContentPart{metadata: %{raw_block: block}})
+       when is_map(block),
+       do: block
+
   defp encode_content_part(_), do: nil
 
   defp encode_tool_call_to_tool_use(%ToolCall{id: id, function: %{name: name, arguments: args}}) do

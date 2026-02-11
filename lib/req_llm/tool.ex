@@ -74,7 +74,8 @@ defmodule ReqLLM.Tool do
             compiled: Zoi.any() |> Zoi.default(nil),
             callback: Zoi.any() |> Zoi.required(),
             strict: Zoi.boolean() |> Zoi.default(false),
-            tool_type: Zoi.string() |> Zoi.nullable() |> Zoi.default(nil)
+            tool_type: Zoi.string() |> Zoi.nullable() |> Zoi.default(nil),
+            defer_loading: Zoi.boolean() |> Zoi.default(false)
           })
 
   @typedoc "A tool definition for AI model function calling"
@@ -125,8 +126,14 @@ defmodule ReqLLM.Tool do
                    default: nil,
                    doc:
                      "Custom tool type (e.g., 'memory_20250818' for Anthropic memory tools)"
-                 ]
-               )
+                ],
+                defer_loading: [
+                  type: :boolean,
+                  default: false,
+                  doc:
+                    "When true, the tool is deferred for on-demand discovery via Anthropic's tool search feature"
+                ]
+              )
 
   @doc """
   Creates a new Tool from the given options.
@@ -183,7 +190,8 @@ defmodule ReqLLM.Tool do
         compiled: compiled_schema,
         callback: validated_opts[:callback],
         strict: validated_opts[:strict] || false,
-        tool_type: validated_opts[:tool_type]
+        tool_type: validated_opts[:tool_type],
+        defer_loading: validated_opts[:defer_loading] || false
       }
 
       {:ok, tool}

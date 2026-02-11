@@ -822,11 +822,13 @@ defmodule ReqLLM.Providers.Anthropic do
         # Standard function tool
         schema = ReqLLM.Tool.to_schema(tool, :openai)
 
-        %{
+        base = %{
           name: schema["function"]["name"],
           description: schema["function"]["description"],
           input_schema: schema["function"]["parameters"]
         }
+
+        if tool.defer_loading, do: Map.put(base, :defer_loading, true), else: base
 
       custom_type ->
         # Custom tool type (e.g., memory_20250818)

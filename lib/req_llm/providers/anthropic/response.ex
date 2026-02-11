@@ -165,6 +165,14 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     %ReqLLM.StreamChunk{type: :compaction, text: content}
   end
 
+  defp decode_content_block(%{"type" => "server_tool_use"} = block) do
+    %ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}
+  end
+
+  defp decode_content_block(%{"type" => "tool_search_tool_result"} = block) do
+    %ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}
+  end
+
   defp decode_content_block(_), do: nil
 
   defp decode_content_block_delta(%{"type" => "text_delta", "text" => text}, _index)
@@ -219,6 +227,14 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     [%ReqLLM.StreamChunk{type: :compaction, text: ""}]
   end
 
+  defp decode_content_block_start(%{"type" => "server_tool_use"} = block, _index) do
+    [%ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}]
+  end
+
+  defp decode_content_block_start(%{"type" => "tool_search_tool_result"} = block, _index) do
+    [%ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}]
+  end
+
   defp decode_content_block_start(_, _index), do: []
 
   defp build_message_from_chunks([]), do: nil
@@ -266,6 +282,14 @@ defmodule ReqLLM.Providers.Anthropic.Response do
         provider_data: %{"type" => "thinking"}
       }
     end)
+  end
+
+  defp chunk_to_content_part(%ReqLLM.StreamChunk{
+         type: :content,
+         text: _text,
+         metadata: %{raw_block: _block} = metadata
+       }) do
+    %ReqLLM.Message.ContentPart{type: :text, text: "", metadata: metadata}
   end
 
   defp chunk_to_content_part(%ReqLLM.StreamChunk{type: :content, text: text}) do
@@ -334,10 +358,23 @@ defmodule ReqLLM.Providers.Anthropic.Response do
       Map.get(server_tool_use, "web_search_requests") ||
         Map.get(server_tool_use, :web_search_requests)
 
-    if is_number(web_search) and web_search > 0 do
-      ReqLLM.Usage.Tool.build(:web_search, web_search)
+    tool_search =
+      Map.get(server_tool_use, "tool_search_requests") ||
+        Map.get(server_tool_use, :tool_search_requests)
+
+    result = %{}
+
+    result =
+      if is_number(web_search) and web_search > 0 do
+        Map.merge(result, ReqLLM.Usage.Tool.build(:web_search, web_search))
+      else
+        result
+      end
+
+    if is_number(tool_search) and tool_search > 0 do
+      Map.put(result, :tool_search_requests, tool_search)
     else
-      %{}
+      result
     end
   end
 
