@@ -221,26 +221,35 @@ defmodule ReqLLM.Providers.Anthropic.Context do
     file_id = Map.get(metadata, :file_id) || Map.get(metadata, "file_id")
 
     cond do
-      # Has file_id - reference uploaded file
+      # Has file_id - reference uploaded file, choosing block type based on media_type
       file_id != nil ->
-        %{
-          type: "document",
-          source: %{
-            type: "file",
-            file_id: file_id
-          }
-        }
+        cond do
+          document_media_type?(media_type) ->
+            %{type: "document", source: %{type: "file", file_id: file_id}}
+
+          image_media_type?(media_type) ->
+            %{type: "image", source: %{type: "file", file_id: file_id}}
+
+          true ->
+            # Excel, PowerPoint, Word, CSV, etc. → container_upload
+            %{type: "container_upload", file_id: file_id}
+        end
 
       # Has data - encode as base64 (inline file)
       data != nil ->
-        %{
-          type: "document",
-          source: %{
-            type: "base64",
-            media_type: media_type,
-            data: Base.encode64(data)
-          }
-        }
+        cond do
+          image_media_type?(media_type) ->
+            %{
+              type: "image",
+              source: %{type: "base64", media_type: media_type, data: Base.encode64(data)}
+            }
+
+          true ->
+            %{
+              type: "document",
+              source: %{type: "base64", media_type: media_type, data: Base.encode64(data)}
+            }
+        end
 
       # No file_id and no data - skip this content part
       true ->
@@ -256,14 +265,11 @@ defmodule ReqLLM.Providers.Anthropic.Context do
        }) do
     base64 = Base.encode64(data)
 
-    %{
-      type: "document",
-      source: %{
-        type: "base64",
-        media_type: media_type,
-        data: base64
-      }
-    }
+    if image_media_type?(media_type) do
+      %{type: "image", source: %{type: "base64", media_type: media_type, data: base64}}
+    else
+      %{type: "document", source: %{type: "base64", media_type: media_type, data: base64}}
+    end
   end
 
   defp encode_content_part(%ReqLLM.Message.ContentPart{type: :compaction, text: text}) do
@@ -275,6 +281,12 @@ defmodule ReqLLM.Providers.Anthropic.Context do
        do: block
 
   defp encode_content_part(_), do: nil
+
+  defp document_media_type?(mt) when is_binary(mt), do: mt in ["application/pdf", "text/plain"]
+  defp document_media_type?(_), do: false
+
+  defp image_media_type?(mt) when is_binary(mt), do: String.starts_with?(mt, "image/")
+  defp image_media_type?(_), do: false
 
   defp encode_tool_call_to_tool_use(%ToolCall{id: id, function: %{name: name, arguments: args}}) do
     %{type: "tool_use", id: id, name: name, input: decode_tool_arguments(args)}
