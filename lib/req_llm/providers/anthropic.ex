@@ -105,6 +105,10 @@ defmodule ReqLLM.Providers.Anthropic do
     context_management: [
       type: :map,
       doc: "Context management configuration for tool result and thinking block clearing"
+    ],
+    container: [
+      type: :map,
+      doc: "Container configuration for skills and code execution"
     ]
   ]
 
@@ -382,6 +386,7 @@ defmodule ReqLLM.Providers.Anthropic do
     |> maybe_apply_prompt_caching(opts)
     |> maybe_add_output_format(opts)
     |> maybe_add_context_management(opts)
+    |> maybe_add_container(opts)
   end
 
   defp build_request_url(opts) do
@@ -1311,6 +1316,18 @@ defmodule ReqLLM.Providers.Anthropic do
     case context_management do
       nil -> body
       config when is_map(config) -> Map.put(body, :context_management, config)
+      _ -> body
+    end
+  end
+
+  defp maybe_add_container(body, opts) do
+    container =
+      get_option(opts, :container) ||
+        get_option(get_option(opts, :provider_options, []), :container)
+
+    case container do
+      nil -> body
+      config when is_map(config) -> Map.put(body, :container, config)
       _ -> body
     end
   end

@@ -41,6 +41,8 @@ defmodule ReqLLM.Response do
                 Zoi.literal(:tool_calls),
                 Zoi.literal(:content_filter),
                 Zoi.literal(:error),
+                Zoi.literal(:pause_turn),
+                Zoi.literal(:compaction),
                 Zoi.null()
               ])
               |> Zoi.default(nil),

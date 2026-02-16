@@ -104,6 +104,7 @@ defmodule ReqLLM.Providers.Anthropic.Response do
             "max_tokens" -> :length
             "stop_sequence" -> :stop
             "tool_use" -> :tool_calls
+            "pause_turn" -> :pause_turn
             _ -> :unknown
           end
 
@@ -173,6 +174,10 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     %ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}
   end
 
+  defp decode_content_block(%{"type" => "bash_code_execution_tool_result"} = block) do
+    %ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}
+  end
+
   defp decode_content_block(_), do: nil
 
   defp decode_content_block_delta(%{"type" => "text_delta", "text" => text}, _index)
@@ -232,6 +237,10 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   end
 
   defp decode_content_block_start(%{"type" => "tool_search_tool_result"} = block, _index) do
+    [%ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}]
+  end
+
+  defp decode_content_block_start(%{"type" => "bash_code_execution_tool_result"} = block, _index) do
     [%ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}]
   end
 
@@ -384,6 +393,7 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   defp parse_finish_reason("end_turn"), do: :stop
   defp parse_finish_reason("content_filter"), do: :content_filter
   defp parse_finish_reason("compaction"), do: :compaction
+  defp parse_finish_reason("pause_turn"), do: :pause_turn
   defp parse_finish_reason(reason) when is_binary(reason), do: :error
   defp parse_finish_reason(_), do: nil
 
