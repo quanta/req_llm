@@ -176,6 +176,12 @@ defmodule ReqLLM.Providers.Anthropic.Context do
     end
   end
 
+  # Must come BEFORE the empty-text guard to preserve raw_block content
+  # (e.g. server_tool_use, bash_code_execution_tool_result blocks have type: :text, text: "")
+  defp encode_content_part(%ReqLLM.Message.ContentPart{metadata: %{raw_block: block}})
+       when is_map(block),
+       do: block
+
   defp encode_content_part(%ReqLLM.Message.ContentPart{type: :text, text: ""}), do: nil
 
   defp encode_content_part(%ReqLLM.Message.ContentPart{type: :text, text: text}) do
@@ -275,10 +281,6 @@ defmodule ReqLLM.Providers.Anthropic.Context do
   defp encode_content_part(%ReqLLM.Message.ContentPart{type: :compaction, text: text}) do
     %{type: "compaction", content: text}
   end
-
-  defp encode_content_part(%ReqLLM.Message.ContentPart{metadata: %{raw_block: block}})
-       when is_map(block),
-       do: block
 
   defp encode_content_part(_), do: nil
 
