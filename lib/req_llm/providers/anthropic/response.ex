@@ -178,6 +178,14 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     %ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}
   end
 
+  defp decode_content_block(%{"type" => "text_editor_code_execution"} = block) do
+    %ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}
+  end
+
+  defp decode_content_block(%{"type" => "text_editor_code_execution_tool_result"} = block) do
+    %ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}
+  end
+
   defp decode_content_block(_), do: nil
 
   defp decode_content_block_delta(%{"type" => "text_delta", "text" => text}, _index)
@@ -241,6 +249,14 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   end
 
   defp decode_content_block_start(%{"type" => "bash_code_execution_tool_result"} = block, _index) do
+    [%ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}]
+  end
+
+  defp decode_content_block_start(%{"type" => "text_editor_code_execution"} = block, _index) do
+    [%ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}]
+  end
+
+  defp decode_content_block_start(%{"type" => "text_editor_code_execution_tool_result"} = block, _index) do
     [%ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}]
   end
 
