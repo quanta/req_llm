@@ -186,6 +186,10 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     %ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}
   end
 
+  defp decode_content_block(%{"type" => "advisor_tool_result"} = block) do
+    %ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}
+  end
+
   defp decode_content_block(_), do: nil
 
   defp decode_content_block_delta(%{"type" => "text_delta", "text" => text}, _index)
@@ -256,7 +260,14 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     [%ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}]
   end
 
-  defp decode_content_block_start(%{"type" => "text_editor_code_execution_tool_result"} = block, _index) do
+  defp decode_content_block_start(
+         %{"type" => "text_editor_code_execution_tool_result"} = block,
+         _index
+       ) do
+    [%ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}]
+  end
+
+  defp decode_content_block_start(%{"type" => "advisor_tool_result"} = block, _index) do
     [%ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}]
   end
 
@@ -349,6 +360,7 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     cache_creation = Map.get(usage, "cache_creation_input_tokens", 0)
     reasoning_tokens = Map.get(usage, "reasoning_output_tokens", 0)
     tool_usage = anthropic_tool_usage(usage)
+    iterations = parse_iterations(Map.get(usage, "iterations"))
 
     base = %{
       input_tokens: input,
@@ -360,10 +372,17 @@ defmodule ReqLLM.Providers.Anthropic.Response do
       reasoning_tokens: reasoning_tokens
     }
 
-    if map_size(tool_usage) > 0 do
-      Map.put(base, :tool_usage, tool_usage)
-    else
+    base =
+      if map_size(tool_usage) > 0 do
+        Map.put(base, :tool_usage, tool_usage)
+      else
+        base
+      end
+
+    if iterations == [] do
       base
+    else
+      Map.put(base, :iterations, iterations)
     end
   end
 
@@ -401,6 +420,28 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     else
       result
     end
+  end
+
+  defp parse_iterations(nil), do: []
+
+  defp parse_iterations(iterations) when is_list(iterations) do
+    Enum.map(iterations, &parse_iteration/1)
+  end
+
+  defp parse_iterations(_), do: []
+
+  defp parse_iteration(iter) when is_map(iter) do
+    %{
+      type: Map.get(iter, "type") || Map.get(iter, :type),
+      model: Map.get(iter, "model") || Map.get(iter, :model),
+      input_tokens: Map.get(iter, "input_tokens") || Map.get(iter, :input_tokens) || 0,
+      output_tokens: Map.get(iter, "output_tokens") || Map.get(iter, :output_tokens) || 0,
+      cache_read_input_tokens:
+        Map.get(iter, "cache_read_input_tokens") || Map.get(iter, :cache_read_input_tokens) || 0,
+      cache_creation_input_tokens:
+        Map.get(iter, "cache_creation_input_tokens") ||
+          Map.get(iter, :cache_creation_input_tokens) || 0
+    }
   end
 
   defp parse_finish_reason("stop"), do: :stop

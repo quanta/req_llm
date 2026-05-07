@@ -833,15 +833,34 @@ defmodule ReqLLM.Providers.Anthropic do
           input_schema: schema["function"]["parameters"]
         }
 
-        if tool.defer_loading, do: Map.put(base, :defer_loading, true), else: base
+        base = if tool.defer_loading, do: Map.put(base, :defer_loading, true), else: base
+
+        # Programmatic tool calling: opt this tool into being callable from
+        # within Anthropic's code-execution sandbox.
+        case tool.allowed_callers do
+          callers when is_list(callers) and callers != [] ->
+            Map.put(base, :allowed_callers, callers)
+
+          _ ->
+            base
+        end
 
       custom_type ->
-        # Custom tool type (e.g., memory_20250818)
-        # These tools only need type and name, no description or input_schema
-        %{
+        # Custom tool type (e.g., memory_20250818, advisor_20260301)
+        # These tools only need type and name, plus any provider_options the
+        # specific tool type requires (e.g., advisor needs `model`).
+        base = %{
           type: custom_type,
           name: tool.name
         }
+
+        case tool.provider_options do
+          opts when is_map(opts) and map_size(opts) > 0 ->
+            Map.merge(base, opts)
+
+          _ ->
+            base
+        end
     end
   end
 

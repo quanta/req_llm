@@ -75,7 +75,9 @@ defmodule ReqLLM.Tool do
             callback: Zoi.any() |> Zoi.required(),
             strict: Zoi.boolean() |> Zoi.default(false),
             tool_type: Zoi.string() |> Zoi.nullable() |> Zoi.default(nil),
-            defer_loading: Zoi.boolean() |> Zoi.default(false)
+            defer_loading: Zoi.boolean() |> Zoi.default(false),
+            allowed_callers: Zoi.any() |> Zoi.nullable() |> Zoi.default(nil),
+            provider_options: Zoi.any() |> Zoi.nullable() |> Zoi.default(nil)
           })
 
   @typedoc "A tool definition for AI model function calling"
@@ -124,16 +126,27 @@ defmodule ReqLLM.Tool do
                  tool_type: [
                    type: {:custom, __MODULE__, :validate_tool_type, []},
                    default: nil,
+                   doc: "Custom tool type (e.g., 'memory_20250818' for Anthropic memory tools)"
+                 ],
+                 defer_loading: [
+                   type: :boolean,
+                   default: false,
                    doc:
-                     "Custom tool type (e.g., 'memory_20250818' for Anthropic memory tools)"
-                ],
-                defer_loading: [
-                  type: :boolean,
-                  default: false,
-                  doc:
-                    "When true, the tool is deferred for on-demand discovery via Anthropic's tool search feature"
-                ]
-              )
+                     "When true, the tool is deferred for on-demand discovery via Anthropic's tool search feature"
+                 ],
+                 allowed_callers: [
+                   type: :any,
+                   default: nil,
+                   doc:
+                     "List of caller tool types permitted to invoke this tool (e.g., [\"code_execution_20250825\"] for programmatic tool calling)"
+                 ],
+                 provider_options: [
+                   type: :any,
+                   default: nil,
+                   doc:
+                     "Provider-specific tool fields merged into the emitted schema (e.g., %{model: \"claude-opus-4-7\"} for Anthropic advisor tool)"
+                 ]
+               )
 
   @doc """
   Creates a new Tool from the given options.
@@ -191,7 +204,9 @@ defmodule ReqLLM.Tool do
         callback: validated_opts[:callback],
         strict: validated_opts[:strict] || false,
         tool_type: validated_opts[:tool_type],
-        defer_loading: validated_opts[:defer_loading] || false
+        defer_loading: validated_opts[:defer_loading] || false,
+        allowed_callers: validated_opts[:allowed_callers],
+        provider_options: validated_opts[:provider_options]
       }
 
       {:ok, tool}
@@ -363,8 +378,7 @@ defmodule ReqLLM.Tool do
   def validate_tool_type(nil), do: {:ok, nil}
   def validate_tool_type(value) when is_binary(value), do: {:ok, value}
 
-  def validate_tool_type(value),
-    do: {:error, "expected string or nil, got: #{inspect(value)}"}
+  def validate_tool_type(value), do: {:error, "expected string or nil, got: #{inspect(value)}"}
 
   # Private functions
 
