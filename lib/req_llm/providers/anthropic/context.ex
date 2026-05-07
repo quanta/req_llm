@@ -179,8 +179,7 @@ defmodule ReqLLM.Providers.Anthropic.Context do
   # Must come BEFORE the empty-text guard to preserve raw_block content
   # (e.g. server_tool_use, bash_code_execution_tool_result blocks have type: :text, text: "")
   defp encode_content_part(%ReqLLM.Message.ContentPart{metadata: %{raw_block: block}})
-       when is_map(block),
-       do: block
+       when is_map(block), do: block
 
   defp encode_content_part(%ReqLLM.Message.ContentPart{type: :text, text: ""}), do: nil
 
@@ -243,18 +242,16 @@ defmodule ReqLLM.Providers.Anthropic.Context do
 
       # Has data - encode as base64 (inline file)
       data != nil ->
-        cond do
-          image_media_type?(media_type) ->
-            %{
-              type: "image",
-              source: %{type: "base64", media_type: media_type, data: Base.encode64(data)}
-            }
-
-          true ->
-            %{
-              type: "document",
-              source: %{type: "base64", media_type: media_type, data: Base.encode64(data)}
-            }
+        if image_media_type?(media_type) do
+          %{
+            type: "image",
+            source: %{type: "base64", media_type: media_type, data: Base.encode64(data)}
+          }
+        else
+          %{
+            type: "document",
+            source: %{type: "base64", media_type: media_type, data: Base.encode64(data)}
+          }
         end
 
       # No file_id and no data - skip this content part
