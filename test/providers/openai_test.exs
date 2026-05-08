@@ -464,6 +464,95 @@ defmodule ReqLLM.Providers.OpenAITest do
       assert decoded["input"] == "Hello, world!"
       assert decoded["dimensions"] == 512
     end
+
+    test "encode_body includes service_tier when provided" do
+      {:ok, model} = ReqLLM.model("openai:gpt-4o")
+      context = context_fixture()
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          service_tier: "auto"
+        ]
+      }
+
+      updated_request = OpenAI.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      assert decoded["service_tier"] == "auto"
+    end
+
+    test "encode_body includes service_tier when provided as flex" do
+      {:ok, model} = ReqLLM.model("openai:gpt-4o")
+      context = context_fixture()
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          service_tier: "flex"
+        ]
+      }
+
+      updated_request = OpenAI.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      assert decoded["service_tier"] == "flex"
+    end
+
+    test "encode_body includes verbosity when provided as atom" do
+      {:ok, model} = ReqLLM.model("openai:gpt-4o")
+      context = context_fixture()
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          provider_options: [verbosity: :low]
+        ]
+      }
+
+      updated_request = OpenAI.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      assert decoded["verbosity"] == "low"
+    end
+
+    test "encode_body includes verbosity when provided as string" do
+      {:ok, model} = ReqLLM.model("openai:gpt-4o")
+      context = context_fixture()
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          provider_options: [verbosity: "high"]
+        ]
+      }
+
+      updated_request = OpenAI.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      assert decoded["verbosity"] == "high"
+    end
+
+    test "encode_body omits verbosity when not provided" do
+      {:ok, model} = ReqLLM.model("openai:gpt-4o")
+      context = context_fixture()
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model
+        ]
+      }
+
+      updated_request = OpenAI.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      refute Map.has_key?(decoded, "verbosity")
+    end
   end
 
   describe "response decoding" do
@@ -1028,6 +1117,101 @@ defmodule ReqLLM.Providers.OpenAITest do
       # The message should still contain the original JSON text
       text = ReqLLM.Response.text(response)
       assert text == ~s({"name":"Mara Ellington"})
+    end
+  end
+
+  describe "attachment validation" do
+    test "accepts image attachments" do
+      {:ok, model} = ReqLLM.model("openai:gpt-4o")
+
+      image_part = ReqLLM.Message.ContentPart.file(<<1, 2, 3>>, "image.png", "image/png")
+      message = %ReqLLM.Message{role: :user, content: [image_part]}
+      context = %ReqLLM.Context{messages: [message]}
+
+      {:ok, _request} = OpenAI.prepare_request(:chat, model, context, [])
+    end
+
+    test "accepts jpeg, gif, and webp attachments" do
+      {:ok, model} = ReqLLM.model("openai:gpt-4o")
+
+      for mime <- ~w(image/jpeg image/gif image/webp) do
+        part = ReqLLM.Message.ContentPart.file(<<1, 2, 3>>, "image", mime)
+        message = %ReqLLM.Message{role: :user, content: [part]}
+        context = %ReqLLM.Context{messages: [message]}
+
+        assert {:ok, _request} = OpenAI.prepare_request(:chat, model, context, [])
+      end
+    end
+
+    test "rejects PDF attachments with clear error" do
+      {:ok, model} = ReqLLM.model("openai:gpt-4o")
+
+      pdf_part = ReqLLM.Message.ContentPart.file(<<1, 2, 3>>, "doc.pdf", "application/pdf")
+      message = %ReqLLM.Message{role: :user, content: [pdf_part]}
+      context = %ReqLLM.Context{messages: [message]}
+
+      {:error, error} = OpenAI.prepare_request(:chat, model, context, [])
+
+      assert %ReqLLM.Error.Invalid.Parameter{} = error
+      assert error.parameter =~ "only supports image attachments"
+      assert error.parameter =~ "application/pdf"
+      assert error.parameter =~ "Anthropic or Google"
+    end
+
+    test "rejects text file attachments" do
+      {:ok, model} = ReqLLM.model("openai:gpt-4o")
+
+      text_part = ReqLLM.Message.ContentPart.file("content", "file.txt", "text/plain")
+      message = %ReqLLM.Message{role: :user, content: [text_part]}
+      context = %ReqLLM.Context{messages: [message]}
+
+      {:error, error} = OpenAI.prepare_request(:chat, model, context, [])
+
+      assert %ReqLLM.Error.Invalid.Parameter{} = error
+      assert error.parameter =~ "text/plain"
+    end
+
+    test "allows mixed text and image content" do
+      {:ok, model} = ReqLLM.model("openai:gpt-4o")
+
+      text_part = ReqLLM.Message.ContentPart.text("Describe this image")
+      image_part = ReqLLM.Message.ContentPart.file(<<1, 2, 3>>, "image.png", "image/png")
+      message = %ReqLLM.Message{role: :user, content: [text_part, image_part]}
+      context = %ReqLLM.Context{messages: [message]}
+
+      {:ok, _request} = OpenAI.prepare_request(:chat, model, context, [])
+    end
+  end
+
+  describe "ResponsesAPI tool encoding" do
+    test "passes through built-in web_search tool definitions" do
+      {:ok, model} = ReqLLM.model("openai:gpt-5-nano")
+
+      context = %ReqLLM.Context{
+        messages: [
+          %ReqLLM.Message{
+            role: :user,
+            content: [%ReqLLM.Message.ContentPart{type: :text, text: "Search the web"}]
+          }
+        ]
+      }
+
+      opts = [
+        context: context,
+        model: model.model,
+        tools: [%{"type" => "web_search"}]
+      ]
+
+      request = %Req.Request{
+        url: URI.parse("https://api.openai.com/v1/responses"),
+        method: :post,
+        options: opts
+      }
+
+      encoded_request = ReqLLM.Providers.OpenAI.ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded_request.body)
+
+      assert Enum.any?(body["tools"], fn tool -> tool["type"] == "web_search" end)
     end
   end
 end

@@ -67,27 +67,44 @@ defmodule ReqLLM.StreamResponse do
   - Seamless backward compatibility
   """
 
-  use TypedStruct
-
   alias ReqLLM.Context
   alias ReqLLM.Provider.ResponseBuilder
   alias ReqLLM.Response
+  alias ReqLLM.Response.Stream, as: ResponseStream
   alias ReqLLM.StreamResponse.MetadataHandle
 
-  typedstruct enforce: true do
-    @typedoc """
-    A streaming response with concurrent metadata processing.
+  @schema Zoi.struct(__MODULE__, %{
+            stream: Zoi.any() |> Zoi.required(),
+            metadata_handle: Zoi.any() |> Zoi.required(),
+            cancel: Zoi.any() |> Zoi.required(),
+            model: Zoi.any() |> Zoi.required(),
+            context: Zoi.any() |> Zoi.required()
+          })
 
-    Contains a stream of chunks, a handle for metadata collection, cancellation function,
-    and contextual information for multi-turn conversations.
-    """
+  @typedoc """
+  A streaming response with concurrent metadata processing.
 
-    field(:stream, Enumerable.t(), doc: "Lazy stream of StreamChunk structs")
-    field(:metadata_handle, MetadataHandle.t(), doc: "Handle collecting usage and finish_reason")
-    field(:cancel, (-> :ok), doc: "Function to cancel streaming and cleanup resources")
-    field(:model, LLMDB.Model.t(), doc: "Model specification that generated this response")
-    field(:context, Context.t(), doc: "Conversation context including new messages")
-  end
+  Contains a stream of chunks, a handle for metadata collection, cancellation function,
+  and contextual information for multi-turn conversations.
+
+  - `stream` - Lazy stream of StreamChunk structs
+  - `metadata_handle` - Handle collecting usage and finish_reason
+  - `cancel` - Function to cancel streaming and cleanup resources
+  - `model` - Model specification that generated this response
+  - `context` - Conversation context including new messages
+  """
+  @type t :: %__MODULE__{
+          stream: Enumerable.t(),
+          metadata_handle: MetadataHandle.t(),
+          cancel: (-> :ok),
+          model: LLMDB.Model.t(),
+          context: Context.t()
+        }
+
+  @enforce_keys Zoi.Struct.enforce_keys(@schema)
+  defstruct Zoi.Struct.struct_fields(@schema)
+
+  def schema, do: @schema
 
   @doc """
   Extract text tokens from the stream, filtering out metadata chunks.
@@ -208,61 +225,90 @@ defmodule ReqLLM.StreamResponse do
   """
   @spec extract_tool_calls(t()) :: [map()]
   def extract_tool_calls(%__MODULE__{stream: stream}) do
-    chunks = Enum.to_list(stream)
+    stream
+    |> ResponseStream.summarize()
+    |> Map.fetch!(:tool_calls)
+  end
 
-    # Extract base tool calls
-    tool_calls =
-      chunks
-      |> Enum.filter(&(&1.type == :tool_call))
-      |> Enum.map(fn chunk ->
-        %{
-          id: Map.get(chunk.metadata, :id) || "call_#{:erlang.unique_integer()}",
-          name: chunk.name,
-          arguments: chunk.arguments || %{},
-          index: Map.get(chunk.metadata, :index, 0)
+  @typedoc """
+  Result of classifying a streaming response.
+
+  - `type` - `:tool_calls` if the model requested tool execution, `:final_answer` otherwise
+  - `text` - Accumulated text content from the response
+  - `thinking` - Accumulated thinking/reasoning content (if any)
+  - `tool_calls` - List of complete tool calls with parsed arguments
+  - `finish_reason` - The normalized finish reason (`:stop`, `:tool_calls`, `:length`, etc.)
+  """
+  @type classify_result :: %{
+          type: :tool_calls | :final_answer,
+          text: String.t(),
+          thinking: String.t(),
+          tool_calls: [map()],
+          finish_reason: atom() | nil
         }
-      end)
 
-    # Collect argument fragments from meta chunks
-    arg_fragments =
-      chunks
-      |> Enum.filter(fn
-        %{type: :meta, metadata: %{tool_call_args: _}} -> true
-        _ -> false
-      end)
-      |> Enum.group_by(fn chunk ->
-        chunk.metadata.tool_call_args.index
-      end)
-      |> Map.new(fn {index, fragments} ->
-        accumulated_json =
-          fragments
-          |> Enum.map_join("", & &1.metadata.tool_call_args.fragment)
+  @doc """
+  Classify a streaming response for tool-calling workflows.
 
-        {index, accumulated_json}
-      end)
+  Consumes the stream and returns a structured result indicating whether the model
+  wants to call tools or has provided a final answer. This is the recommended API
+  for ReAct agents and function-calling applications.
 
-    # Merge accumulated arguments back into tool calls
-    tool_calls
-    |> Enum.map(fn tool_call ->
-      case Map.get(arg_fragments, tool_call.index) do
-        nil ->
-          # No accumulated arguments, keep as is
-          Map.delete(tool_call, :index)
+  ## Parameters
 
-        json_str ->
-          # Parse accumulated JSON arguments
-          case Jason.decode(json_str) do
-            {:ok, args} ->
-              tool_call
-              |> Map.put(:arguments, args)
-              |> Map.delete(:index)
+    * `stream_response` - The StreamResponse struct
 
-            {:error, _} ->
-              # Invalid JSON, keep empty arguments
-              Map.delete(tool_call, :index)
-          end
+  ## Returns
+
+  A map with:
+    - `type` - `:tool_calls` if the model requested tool execution, `:final_answer` otherwise
+    - `text` - Accumulated text content from the response
+    - `thinking` - Accumulated thinking/reasoning content
+    - `tool_calls` - List of complete tool calls with parsed arguments
+    - `finish_reason` - The normalized finish reason
+
+  ## Examples
+
+      {:ok, stream_response} = ReqLLM.stream_text(model, messages, tools: tools)
+
+      case ReqLLM.StreamResponse.classify(stream_response) do
+        %{type: :tool_calls, tool_calls: calls} ->
+          # Execute tools and continue conversation
+          results = Enum.map(calls, &execute_tool/1)
+          # Build tool result messages and continue...
+
+        %{type: :final_answer, text: answer} ->
+          # Done - return answer to user
+          {:ok, answer}
       end
-    end)
+
+  ## Classification Logic
+
+  The classification uses multiple signals:
+
+  1. If `tool_calls` is non-empty, type is `:tool_calls`
+  2. If `finish_reason` is `:tool_calls`, type is `:tool_calls`
+  3. Otherwise, type is `:final_answer`
+
+  """
+  @spec classify(t()) :: classify_result()
+  def classify(%__MODULE__{stream: stream}) do
+    summary = ResponseStream.summarize(stream)
+
+    type =
+      cond do
+        summary.tool_calls != [] -> :tool_calls
+        summary.finish_reason == :tool_calls -> :tool_calls
+        true -> :final_answer
+      end
+
+    %{
+      type: type,
+      text: summary.text,
+      thinking: summary.thinking,
+      tool_calls: summary.tool_calls,
+      finish_reason: summary.finish_reason
+    }
   end
 
   @doc """
@@ -330,21 +376,23 @@ defmodule ReqLLM.StreamResponse do
   def process_stream(%__MODULE__{} = stream_response, opts \\ []) do
     callbacks = extract_callbacks(opts)
 
-    # Process stream chunks with callbacks, collecting them as we go
     chunks = process_stream_with_callbacks(stream_response.stream, callbacks)
-
-    # Await metadata from the concurrent collection task
     metadata = MetadataHandle.await(stream_response.metadata_handle)
 
-    # Use the appropriate ResponseBuilder for this model
-    builder = ResponseBuilder.for_model(stream_response.model)
+    case metadata do
+      %{error: reason} ->
+        {:error, reason}
 
-    builder.build_response(
-      chunks,
-      metadata,
-      context: stream_response.context,
-      model: stream_response.model
-    )
+      _ ->
+        builder = ResponseBuilder.for_model(stream_response.model)
+
+        builder.build_response(
+          chunks,
+          metadata,
+          context: stream_response.context,
+          model: stream_response.model
+        )
+    end
   rescue
     error -> {:error, error}
   catch

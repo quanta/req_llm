@@ -13,50 +13,49 @@ defmodule ReqLLM.Response do
 
       # Basic response usage
       {:ok, response} = ReqLLM.generate_text("anthropic:claude-3-sonnet", context)
-      response.text()  #=> "Hello! I'm Claude."
-      response.usage()  #=> %{input_tokens: 12, output_tokens: 4, total_cost: 0.016}
+      ReqLLM.Response.text(response)  #=> "Hello! I'm Claude."
+      ReqLLM.Response.usage(response)  #=> %{input_tokens: 12, output_tokens: 4, total_cost: 0.016}
 
       # Multi-turn conversation (no manual context building)
       {:ok, response2} = ReqLLM.generate_text("anthropic:claude-3-sonnet", response.context)
 
-      # Tool calling loop
-      {:ok, final_response} = ReqLLM.Response.handle_tools(response, tools)
-
   """
 
-  use TypedStruct
-
-  alias ReqLLM.{Context, Message}
+  alias ReqLLM.Message
 
   @derive {Jason.Encoder, except: [:stream]}
 
-  typedstruct enforce: true do
-    # ---------- Core ----------
-    # Provider id of the turn
-    field(:id, String.t())
-    # Model that produced the turn
-    field(:model, String.t())
-    # History incl. new assistant msg
-    field(:context, Context.t())
-    # The assistant/tool message created by this turn
-    field(:message, Message.t() | nil)
-    # Structured object for object generation
-    field(:object, map() | nil, default: nil)
+  @schema Zoi.struct(__MODULE__, %{
+            id: Zoi.string(),
+            model: Zoi.string(),
+            context: Zoi.any(),
+            message: Zoi.any() |> Zoi.default(nil),
+            object: Zoi.union([Zoi.map(), Zoi.null()]) |> Zoi.default(nil),
+            stream?: Zoi.boolean() |> Zoi.default(false),
+            stream: Zoi.any() |> Zoi.default(nil),
+            usage: Zoi.union([Zoi.map(), Zoi.null()]) |> Zoi.default(nil),
+            finish_reason:
+              Zoi.union([
+                Zoi.literal(:stop),
+                Zoi.literal(:length),
+                Zoi.literal(:tool_calls),
+                Zoi.literal(:content_filter),
+                Zoi.literal(:error),
+                Zoi.literal(:pause_turn),
+                Zoi.literal(:compaction),
+                Zoi.null()
+              ])
+              |> Zoi.default(nil),
+            provider_meta: Zoi.map() |> Zoi.default(%{}),
+            error: Zoi.any() |> Zoi.default(nil)
+          })
 
-    # ---------- Streams ----------
-    field(:stream?, boolean(), default: false)
-    # Stream of StreamChunk when stream? == true
-    field(:stream, Enumerable.t() | nil, default: nil)
+  @type t :: unquote(Zoi.type_spec(@schema))
 
-    # ---------- Metadata ----------
-    field(:usage, map() | nil)
-    field(:finish_reason, :stop | :length | :tool_calls | :content_filter | :error | nil)
-    # Raw provider extras
-    field(:provider_meta, map(), default: %{})
+  @enforce_keys Zoi.Struct.enforce_keys(@schema)
+  defstruct Zoi.Struct.struct_fields(@schema)
 
-    # ---------- Errors ----------
-    field(:error, Exception.t() | nil, default: nil)
-  end
+  def schema, do: @schema
 
   @doc """
   Extract text content from the response message.
@@ -78,6 +77,51 @@ defmodule ReqLLM.Response do
     content
     |> Enum.filter(&(&1.type == :text))
     |> Enum.map_join("", & &1.text)
+  end
+
+  @doc """
+  Extract image content parts from the response message.
+
+  Returns a list of `ReqLLM.Message.ContentPart` where `type` is `:image` or `:image_url`.
+  """
+  @spec images(t()) :: [ReqLLM.Message.ContentPart.t()]
+  def images(%__MODULE__{message: nil}), do: []
+
+  def images(%__MODULE__{message: %Message{content: content}}) do
+    content
+    |> Enum.filter(&(&1.type in [:image, :image_url]))
+  end
+
+  @doc """
+  Returns the first image content part (or nil if none).
+  """
+  @spec image(t()) :: ReqLLM.Message.ContentPart.t() | nil
+  def image(%__MODULE__{} = response) do
+    response
+    |> images()
+    |> List.first()
+  end
+
+  @doc """
+  Returns the binary data of the first `:image` part (or nil).
+  """
+  @spec image_data(t()) :: binary() | nil
+  def image_data(%__MODULE__{} = response) do
+    case response |> images() |> Enum.find(&(&1.type == :image)) do
+      nil -> nil
+      part -> part.data
+    end
+  end
+
+  @doc """
+  Returns the URL of the first `:image_url` part (or nil).
+  """
+  @spec image_url(t()) :: String.t() | nil
+  def image_url(%__MODULE__{} = response) do
+    case response |> images() |> Enum.find(&(&1.type == :image_url)) do
+      nil -> nil
+      part -> part.url
+    end
   end
 
   @doc """
@@ -455,6 +499,9 @@ defmodule ReqLLM.Response do
         case Jason.decode(text_content) do
           {:ok, object} when is_map(object) ->
             {:ok, object}
+
+          {:ok, array} when is_list(array) ->
+            {:ok, array}
 
           {:ok, _other} ->
             {:error, %ReqLLM.Error.API.Response{reason: "Decoded JSON is not an object"}}

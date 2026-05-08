@@ -112,8 +112,11 @@ msg = %ReqLLM.Message{
 
 Typed content elements that compose a `Message`. Common variants:
 - `text/1`: `ContentPart.text("...")`
+- `text/2`: `ContentPart.text("...", metadata)` with metadata map
 - `image_url/1`: `ContentPart.image_url("https://...")`
+- `image_url/2`: `ContentPart.image_url("https://...", metadata)` with metadata
 - `image/2`: `ContentPart.image(binary, "image/png")`
+- `image/3`: `ContentPart.image(binary, "image/png", metadata)` with metadata
 - `file/3`: `ContentPart.file(binary, "name.ext", "mime/type")`
 - `thinking/1`: `ContentPart.thinking("...")` for models that expose reasoning tokens
 - `tool_call/2`: `ContentPart.tool_call("name", %{arg: "value"})` for assistant-issued calls
@@ -127,9 +130,37 @@ parts = [
 ]
 ```
 
+**Metadata field**:
+
+The `metadata` field allows passing provider-specific attributes through to the wire format. Currently supported metadata keys:
+
+- `cache_control`: Anthropic prompt caching control (e.g., `%{type: "ephemeral"}`)
+
+```elixir
+# Enable prompt caching for text content
+cached_text = ContentPart.text(
+  "Long system prompt to cache...",
+  %{cache_control: %{type: "ephemeral"}}
+)
+
+# Enable prompt caching for images
+cached_image = ContentPart.image_url(
+  "https://example.com/large-diagram.png",
+  %{cache_control: %{type: "ephemeral"}}
+)
+
+# Or with binary image data
+cached_binary_image = ContentPart.image(
+  image_data,
+  "image/png",
+  %{cache_control: %{type: "ephemeral"}}
+)
+```
+
 **How this supports normalization**:
 - Discriminated union eliminates polymorphism across providers.
 - New content types can be added without changing the `Message` shape.
+- Metadata enables provider-specific features without breaking the canonical model.
 
 ## 5) ReqLLM.Tool
 
@@ -138,18 +169,20 @@ Defines callable functions (aka "tools" or "function calling") with validation.
 **Typical fields**:
 - `name`: string
 - `description`: string
-- `schema`: `NimbleOptions`-based schema for argument validation
+- `parameter_schema`: `NimbleOptions`-based schema for argument validation
+- `callback`: function or MFA tuple to execute the tool
 
 **Example**:
 ```elixir
-tool = ReqLLM.Tool.new(
+{:ok, tool} = ReqLLM.Tool.new(
   name: "get_weather",
   description: "Gets weather by city",
-  schema: [city: [type: :string, required: true]]
+  parameter_schema: [city: [type: :string, required: true]],
+  callback: fn %{city: city} -> {:ok, "Weather in #{city}: sunny"} end
 )
 
 # Execute locally (e.g., after a model issues a tool_call)
-{:ok, result} = ReqLLM.Tool.execute(tool, %{city: "NYC"})
+{:ok, result} = ReqLLM.Tool.execute(tool, %{"city" => "NYC"})
 ```
 
 **How this supports normalization**:
@@ -194,6 +227,48 @@ Canonical final response returned by non-streaming calls (and available after st
 text = ReqLLM.Response.text(response)
 usage = ReqLLM.Response.usage(response)
 ```
+
+### Usage Structure
+
+The `usage` field contains normalized usage data with token counts, costs, and tool/image usage:
+
+```elixir
+%{
+  # Token counts
+  input_tokens: 150,
+  output_tokens: 200,
+  total_tokens: 350,
+  reasoning_tokens: 0,        # For reasoning models (o1, o3, gpt-5)
+  cached_tokens: 100,         # Cached input tokens
+  cache_creation_tokens: 0,   # Tokens used to create cache
+
+  # Cost breakdown (USD)
+  input_cost: 0.00045,
+  output_cost: 0.0006,
+  total_cost: 0.00105,
+
+  # Detailed cost by category
+  cost: %{
+    tokens: 0.00105,
+    tools: 0.02,              # Web search, function calls
+    images: 0.0,              # Image generation
+    total: 0.02105,
+    line_items: [...]         # Per-component cost details
+  },
+
+  # Tool usage (web search, etc.)
+  tool_usage: %{
+    web_search: %{count: 2, unit: "call"}
+  },
+
+  # Image usage (for image generation)
+  image_usage: %{
+    generated: %{count: 1, size_class: "1024x1024"}
+  }
+}
+```
+
+See the [Usage & Billing Guide](usage-and-billing.md) for comprehensive documentation.
 
 **How this supports normalization**:
 - One response object to extract text, structured objects, and usage across providers.
@@ -251,10 +326,11 @@ alias ReqLLM.Message.ContentPart
 
 {:ok, model} = ReqLLM.Model.from("anthropic:claude-haiku-4-5")
 
-tool = ReqLLM.Tool.new(
+{:ok, tool} = ReqLLM.Tool.new(
   name: "get_weather",
   description: "Gets weather by city",
-  schema: [city: [type: :string, required: true]]
+  parameter_schema: [city: [type: :string, required: true]],
+  callback: fn %{city: city} -> {:ok, "Weather in #{city}: sunny"} end
 )
 
 context = ReqLLM.Context.new([

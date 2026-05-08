@@ -104,6 +104,7 @@ defmodule ReqLLM.Providers.Anthropic.Response do
             "max_tokens" -> :length
             "stop_sequence" -> :stop
             "tool_use" -> :tool_calls
+            "pause_turn" -> :pause_turn
             _ -> :unknown
           end
 
@@ -149,16 +150,44 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     ReqLLM.StreamChunk.text(text)
   end
 
-  defp decode_content_block(%{"type" => "thinking", "thinking" => text}) do
-    ReqLLM.StreamChunk.thinking(text)
+  defp decode_content_block(%{"type" => "thinking", "thinking" => text} = block) do
+    ReqLLM.StreamChunk.thinking(text, thinking_metadata(block))
   end
 
-  defp decode_content_block(%{"type" => "thinking", "text" => text}) do
-    ReqLLM.StreamChunk.thinking(text)
+  defp decode_content_block(%{"type" => "thinking", "text" => text} = block) do
+    ReqLLM.StreamChunk.thinking(text, thinking_metadata(block))
   end
 
   defp decode_content_block(%{"type" => "tool_use", "id" => id, "name" => name, "input" => input}) do
     ReqLLM.StreamChunk.tool_call(name, input, %{id: id})
+  end
+
+  defp decode_content_block(%{"type" => "compaction", "content" => content}) do
+    %ReqLLM.StreamChunk{type: :compaction, text: content}
+  end
+
+  defp decode_content_block(%{"type" => "server_tool_use"} = block) do
+    %ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}
+  end
+
+  defp decode_content_block(%{"type" => "tool_search_tool_result"} = block) do
+    %ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}
+  end
+
+  defp decode_content_block(%{"type" => "bash_code_execution_tool_result"} = block) do
+    %ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}
+  end
+
+  defp decode_content_block(%{"type" => "text_editor_code_execution"} = block) do
+    %ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}
+  end
+
+  defp decode_content_block(%{"type" => "text_editor_code_execution_tool_result"} = block) do
+    %ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}
+  end
+
+  defp decode_content_block(%{"type" => "advisor_tool_result"} = block) do
+    %ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}
   end
 
   defp decode_content_block(_), do: nil
@@ -170,12 +199,12 @@ defmodule ReqLLM.Providers.Anthropic.Response do
 
   defp decode_content_block_delta(%{"type" => "thinking_delta", "thinking" => text}, _index)
        when is_binary(text) do
-    [ReqLLM.StreamChunk.thinking(text)]
+    [ReqLLM.StreamChunk.thinking(text, thinking_metadata())]
   end
 
   defp decode_content_block_delta(%{"type" => "thinking_delta", "text" => text}, _index)
        when is_binary(text) do
-    [ReqLLM.StreamChunk.thinking(text)]
+    [ReqLLM.StreamChunk.thinking(text, thinking_metadata())]
   end
 
   defp decode_content_block_delta(
@@ -187,6 +216,11 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     [ReqLLM.StreamChunk.meta(%{tool_call_args: %{index: index, fragment: fragment}})]
   end
 
+  defp decode_content_block_delta(%{"type" => "compaction_delta", "content" => content}, _index)
+       when is_binary(content) do
+    [%ReqLLM.StreamChunk{type: :compaction, text: content}]
+  end
+
   defp decode_content_block_delta(_, _index), do: []
 
   defp decode_content_block_start(%{"type" => "text", "text" => text}, _index) do
@@ -194,16 +228,47 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   end
 
   defp decode_content_block_start(%{"type" => "thinking", "thinking" => text}, _index) do
-    [ReqLLM.StreamChunk.thinking(text)]
+    [ReqLLM.StreamChunk.thinking(text, thinking_metadata())]
   end
 
   defp decode_content_block_start(%{"type" => "thinking", "text" => text}, _index) do
-    [ReqLLM.StreamChunk.thinking(text)]
+    [ReqLLM.StreamChunk.thinking(text, thinking_metadata())]
   end
 
   defp decode_content_block_start(%{"type" => "tool_use", "id" => id, "name" => name}, index) do
     # Tool call start - send empty arguments that will be filled by deltas
     [ReqLLM.StreamChunk.tool_call(name, %{}, %{id: id, index: index, start: true})]
+  end
+
+  defp decode_content_block_start(%{"type" => "compaction"}, _index) do
+    [%ReqLLM.StreamChunk{type: :compaction, text: ""}]
+  end
+
+  defp decode_content_block_start(%{"type" => "server_tool_use"} = block, _index) do
+    [%ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}]
+  end
+
+  defp decode_content_block_start(%{"type" => "tool_search_tool_result"} = block, _index) do
+    [%ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}]
+  end
+
+  defp decode_content_block_start(%{"type" => "bash_code_execution_tool_result"} = block, _index) do
+    [%ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}]
+  end
+
+  defp decode_content_block_start(%{"type" => "text_editor_code_execution"} = block, _index) do
+    [%ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}]
+  end
+
+  defp decode_content_block_start(
+         %{"type" => "text_editor_code_execution_tool_result"} = block,
+         _index
+       ) do
+    [%ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}]
+  end
+
+  defp decode_content_block_start(%{"type" => "advisor_tool_result"} = block, _index) do
+    [%ReqLLM.StreamChunk{type: :content, text: "", metadata: %{raw_block: block}}]
   end
 
   defp decode_content_block_start(_, _index), do: []
@@ -213,7 +278,7 @@ defmodule ReqLLM.Providers.Anthropic.Response do
   defp build_message_from_chunks(chunks) do
     content_parts =
       chunks
-      |> Enum.filter(&(&1.type in [:content, :thinking]))
+      |> Enum.filter(&(&1.type in [:content, :thinking, :compaction]))
       |> Enum.map(&chunk_to_content_part/1)
       |> Enum.reject(&is_nil/1)
 
@@ -223,14 +288,44 @@ defmodule ReqLLM.Providers.Anthropic.Response do
       |> Enum.map(&chunk_to_tool_call/1)
       |> Enum.reject(&is_nil/1)
 
+    reasoning_details = extract_reasoning_details(chunks)
+
     if content_parts != [] or tool_calls != [] do
       %ReqLLM.Message{
         role: :assistant,
         content: content_parts,
         tool_calls: if(tool_calls != [], do: tool_calls),
+        reasoning_details: if(reasoning_details != [], do: reasoning_details),
         metadata: %{}
       }
     end
+  end
+
+  defp extract_reasoning_details(chunks) do
+    chunks
+    |> Enum.filter(&(&1.type == :thinking))
+    |> Enum.with_index()
+    |> Enum.map(fn {chunk, index} ->
+      sig = Map.get(chunk.metadata, :signature)
+
+      %ReqLLM.Message.ReasoningDetails{
+        text: chunk.text,
+        signature: sig,
+        encrypted?: sig != nil,
+        provider: :anthropic,
+        format: "anthropic-thinking-v1",
+        index: index,
+        provider_data: %{"type" => "thinking"}
+      }
+    end)
+  end
+
+  defp chunk_to_content_part(%ReqLLM.StreamChunk{
+         type: :content,
+         text: _text,
+         metadata: %{raw_block: _block} = metadata
+       }) do
+    %ReqLLM.Message.ContentPart{type: :text, text: "", metadata: metadata}
   end
 
   defp chunk_to_content_part(%ReqLLM.StreamChunk{type: :content, text: text}) do
@@ -239,6 +334,10 @@ defmodule ReqLLM.Providers.Anthropic.Response do
 
   defp chunk_to_content_part(%ReqLLM.StreamChunk{type: :thinking, text: text}) do
     %ReqLLM.Message.ContentPart{type: :thinking, text: text}
+  end
+
+  defp chunk_to_content_part(%ReqLLM.StreamChunk{type: :compaction, text: text}) do
+    %ReqLLM.Message.ContentPart{type: :compaction, text: text}
   end
 
   defp chunk_to_content_part(_), do: nil
@@ -260,8 +359,10 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     cache_read = Map.get(usage, "cache_read_input_tokens", 0)
     cache_creation = Map.get(usage, "cache_creation_input_tokens", 0)
     reasoning_tokens = Map.get(usage, "reasoning_output_tokens", 0)
+    tool_usage = anthropic_tool_usage(usage)
+    iterations = parse_iterations(Map.get(usage, "iterations"))
 
-    %{
+    base = %{
       input_tokens: input,
       output_tokens: output,
       total_tokens: input + output,
@@ -270,6 +371,19 @@ defmodule ReqLLM.Providers.Anthropic.Response do
       cache_creation_input_tokens: cache_creation,
       reasoning_tokens: reasoning_tokens
     }
+
+    base =
+      if map_size(tool_usage) > 0 do
+        Map.put(base, :tool_usage, tool_usage)
+      else
+        base
+      end
+
+    if iterations == [] do
+      base
+    else
+      Map.put(base, :iterations, iterations)
+    end
   end
 
   defp parse_usage(_),
@@ -281,11 +395,74 @@ defmodule ReqLLM.Providers.Anthropic.Response do
       reasoning_tokens: 0
     }
 
+  defp anthropic_tool_usage(usage) when is_map(usage) do
+    server_tool_use = Map.get(usage, "server_tool_use") || Map.get(usage, :server_tool_use) || %{}
+
+    web_search =
+      Map.get(server_tool_use, "web_search_requests") ||
+        Map.get(server_tool_use, :web_search_requests)
+
+    tool_search =
+      Map.get(server_tool_use, "tool_search_requests") ||
+        Map.get(server_tool_use, :tool_search_requests)
+
+    result = %{}
+
+    result =
+      if is_number(web_search) and web_search > 0 do
+        Map.merge(result, ReqLLM.Usage.Tool.build(:web_search, web_search))
+      else
+        result
+      end
+
+    if is_number(tool_search) and tool_search > 0 do
+      Map.put(result, :tool_search_requests, tool_search)
+    else
+      result
+    end
+  end
+
+  defp parse_iterations(nil), do: []
+
+  defp parse_iterations(iterations) when is_list(iterations) do
+    Enum.map(iterations, &parse_iteration/1)
+  end
+
+  defp parse_iterations(_), do: []
+
+  defp parse_iteration(iter) when is_map(iter) do
+    %{
+      type: Map.get(iter, "type") || Map.get(iter, :type),
+      model: Map.get(iter, "model") || Map.get(iter, :model),
+      input_tokens: Map.get(iter, "input_tokens") || Map.get(iter, :input_tokens) || 0,
+      output_tokens: Map.get(iter, "output_tokens") || Map.get(iter, :output_tokens) || 0,
+      cache_read_input_tokens:
+        Map.get(iter, "cache_read_input_tokens") || Map.get(iter, :cache_read_input_tokens) || 0,
+      cache_creation_input_tokens:
+        Map.get(iter, "cache_creation_input_tokens") ||
+          Map.get(iter, :cache_creation_input_tokens) || 0
+    }
+  end
+
   defp parse_finish_reason("stop"), do: :stop
   defp parse_finish_reason("max_tokens"), do: :length
   defp parse_finish_reason("tool_use"), do: :tool_calls
   defp parse_finish_reason("end_turn"), do: :stop
   defp parse_finish_reason("content_filter"), do: :content_filter
+  defp parse_finish_reason("compaction"), do: :compaction
+  defp parse_finish_reason("pause_turn"), do: :pause_turn
   defp parse_finish_reason(reason) when is_binary(reason), do: :error
   defp parse_finish_reason(_), do: nil
+
+  defp thinking_metadata(block \\ %{}) do
+    signature = Map.get(block, "signature")
+
+    %{
+      signature: signature,
+      encrypted?: signature != nil,
+      provider: :anthropic,
+      format: "anthropic-thinking-v1",
+      provider_data: %{"type" => "thinking"}
+    }
+  end
 end

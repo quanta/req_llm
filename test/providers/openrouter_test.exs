@@ -130,6 +130,7 @@ defmodule ReqLLM.Providers.OpenRouterTest do
       updated_request = OpenRouter.encode_body(mock_request)
 
       assert is_binary(updated_request.body)
+      assert_no_duplicate_json_keys(updated_request.body)
       decoded = Jason.decode!(updated_request.body)
 
       assert decoded["model"] == "openai/gpt-4"
@@ -167,6 +168,7 @@ defmodule ReqLLM.Providers.OpenRouterTest do
       }
 
       updated_request = OpenRouter.encode_body(mock_request)
+      assert_no_duplicate_json_keys(updated_request.body)
       decoded = Jason.decode!(updated_request.body)
 
       assert is_list(decoded["tools"])
@@ -204,6 +206,7 @@ defmodule ReqLLM.Providers.OpenRouterTest do
       }
 
       updated_request = OpenRouter.encode_body(mock_request)
+      assert_no_duplicate_json_keys(updated_request.body)
       decoded = Jason.decode!(updated_request.body)
 
       assert is_list(decoded["tools"])
@@ -212,6 +215,83 @@ defmodule ReqLLM.Providers.OpenRouterTest do
                "type" => "function",
                "function" => %{"name" => "specific_tool"}
              }
+    end
+
+    test "encode_body with streaming includes stream_options without duplicates" do
+      {:ok, model} = ReqLLM.model("openrouter:openai/gpt-4")
+      context = context_fixture()
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          stream: true
+        ]
+      }
+
+      updated_request = OpenRouter.encode_body(mock_request)
+      assert_no_duplicate_json_keys(updated_request.body)
+      decoded = Jason.decode!(updated_request.body)
+
+      assert decoded["stream"] == true
+      assert decoded["stream_options"] == %{"include_usage" => true}
+    end
+
+    test "encode_body with openrouter_usage option" do
+      {:ok, model} = ReqLLM.model("openrouter:openai/gpt-4")
+      context = context_fixture()
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          stream: false,
+          openrouter_usage: %{include: true}
+        ]
+      }
+
+      updated_request = OpenRouter.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      assert decoded["usage"] == %{"include" => true}
+    end
+
+    test "encode_body with openrouter_plugins option" do
+      {:ok, model} = ReqLLM.model("openrouter:openai/gpt-4")
+      context = context_fixture()
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          stream: false,
+          openrouter_plugins: [%{id: "web"}]
+        ]
+      }
+
+      updated_request = OpenRouter.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      assert decoded["plugins"] == [%{"id" => "web"}]
+    end
+
+    test "encode_body with multiple openrouter_plugins" do
+      {:ok, model} = ReqLLM.model("openrouter:openai/gpt-4")
+      context = context_fixture()
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          stream: false,
+          openrouter_plugins: [%{id: "web"}, %{id: "code"}]
+        ]
+      }
+
+      updated_request = OpenRouter.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      assert decoded["plugins"] == [%{"id" => "web"}, %{"id" => "code"}]
     end
 
     test "encode_body with response_format" do
@@ -333,6 +413,84 @@ defmodule ReqLLM.Providers.OpenRouterTest do
       # Verify context advancement (original + assistant)
       assert length(response.context.messages) == 3
       assert List.last(response.context.messages).role == :assistant
+    end
+
+    test "prepare_request for :object with openrouter_structured_output_mode: :json_schema uses native schema" do
+      {:ok, model} = ReqLLM.model("openrouter:openai/gpt-4")
+      context = context_fixture()
+      {:ok, schema} = ReqLLM.Schema.compile(name: [type: :string])
+
+      opts = [
+        compiled_schema: schema,
+        provider_options: [openrouter_structured_output_mode: :json_schema]
+      ]
+
+      {:ok, request} = OpenRouter.prepare_request(:object, model, context, opts)
+
+      assert %{
+               type: "json_schema",
+               json_schema: %{
+                 strict: true,
+                 name: "structured_output",
+                 schema: _
+               }
+             } = request.options[:response_format]
+
+      refute Map.has_key?(request.options, :tools)
+      refute Map.has_key?(request.options, :tool_choice)
+      assert request.options[:max_tokens] == 4096
+    end
+
+    test "prepare_request for :object with json_schema mode respects custom max_tokens" do
+      {:ok, model} = ReqLLM.model("openrouter:openai/gpt-4")
+      context = context_fixture()
+      {:ok, schema} = ReqLLM.Schema.compile(name: [type: :string])
+
+      opts = [
+        compiled_schema: schema,
+        max_tokens: 8192,
+        provider_options: [openrouter_structured_output_mode: :json_schema]
+      ]
+
+      {:ok, request} = OpenRouter.prepare_request(:object, model, context, opts)
+
+      assert request.options[:max_tokens] == 8192
+    end
+
+    test "prepare_request for :object with json_schema mode enforces minimum max_tokens" do
+      {:ok, model} = ReqLLM.model("openrouter:openai/gpt-4")
+      context = context_fixture()
+      {:ok, schema} = ReqLLM.Schema.compile(name: [type: :string])
+
+      opts = [
+        compiled_schema: schema,
+        max_tokens: 50,
+        provider_options: [openrouter_structured_output_mode: :json_schema]
+      ]
+
+      {:ok, request} = OpenRouter.prepare_request(:object, model, context, opts)
+
+      assert request.options[:max_tokens] == 200
+    end
+
+    test "prepare_request for :object falls back to tools when mode is not :json_schema" do
+      {:ok, model} = ReqLLM.model("openrouter:openai/gpt-4")
+      context = context_fixture()
+      {:ok, schema} = ReqLLM.Schema.compile(name: [type: :string])
+
+      opts = [compiled_schema: schema]
+
+      {:ok, request} = OpenRouter.prepare_request(:object, model, context, opts)
+
+      assert Map.has_key?(request.options, :tools)
+
+      assert request.options[:tool_choice] == %{
+               type: "function",
+               function: %{name: "structured_output"}
+             }
+
+      refute Map.has_key?(request.options, :response_format)
+      assert request.options[:max_tokens] == 4096
     end
 
     test "decode_response handles streaming responses" do
@@ -700,6 +858,383 @@ defmodule ReqLLM.Providers.OpenRouterTest do
       headers = Map.new(request.headers)
       assert headers["http-referer"] == ["https://myapp.com"]
       assert headers["x-title"] == ["My Cool App"]
+    end
+  end
+
+  describe "reasoning_details support" do
+    test "extracts reasoning_details as ReasoningDetails structs from non-streaming response" do
+      fixture_path =
+        Path.join([
+          __DIR__,
+          "..",
+          "support",
+          "fixtures",
+          "openrouter",
+          "google_gemini_2_5_flash",
+          "reasoning_basic.json"
+        ])
+
+      fixture = File.read!(fixture_path) |> Jason.decode!()
+
+      req = Req.new()
+
+      resp = %Req.Response{
+        status: 200,
+        body: fixture["response"]["body"]
+      }
+
+      {^req, decoded_resp} = OpenRouter.decode_response({req, resp})
+
+      response = decoded_resp.body
+
+      assert response.message.reasoning_details != nil
+      assert is_list(response.message.reasoning_details)
+      refute Enum.empty?(response.message.reasoning_details)
+
+      [first_detail | _] = response.message.reasoning_details
+      assert %ReqLLM.Message.ReasoningDetails{} = first_detail
+      assert first_detail.provider == :openrouter
+      assert first_detail.format == "unknown"
+      assert first_detail.provider_data == %{"type" => "reasoning.text"}
+      assert is_binary(first_detail.text)
+      assert String.contains?(first_detail.text, "Recalling Multiplication")
+    end
+
+    test "reasoning_details is nil for non-reasoning responses" do
+      req = Req.new()
+
+      resp = %Req.Response{
+        status: 200,
+        body: %{
+          "choices" => [
+            %{
+              "message" => %{
+                "role" => "assistant",
+                "content" => "Hello world"
+              },
+              "finish_reason" => "stop"
+            }
+          ],
+          "usage" => %{
+            "prompt_tokens" => 10,
+            "completion_tokens" => 2,
+            "total_tokens" => 12
+          }
+        }
+      }
+
+      {^req, decoded_resp} = OpenRouter.decode_response({req, resp})
+
+      # Should be nil for non-reasoning models
+      response = decoded_resp.body
+      assert response.message.reasoning_details == nil
+    end
+
+    test "encodes ReasoningDetails structs in subsequent requests" do
+      message_with_reasoning = %ReqLLM.Message{
+        role: :assistant,
+        content: [
+          ReqLLM.Message.ContentPart.text("The answer is 84")
+        ],
+        reasoning_details: [
+          %ReqLLM.Message.ReasoningDetails{
+            text: "Let me break down 12 * 7...",
+            provider: :openrouter,
+            format: "google-gemini-v1",
+            index: 0,
+            provider_data: %{"type" => "reasoning.text"}
+          }
+        ]
+      }
+
+      context = %ReqLLM.Context{
+        messages: [
+          %ReqLLM.Message{
+            role: :user,
+            content: [ReqLLM.Message.ContentPart.text("What is 12*7?")]
+          },
+          message_with_reasoning,
+          %ReqLLM.Message{
+            role: :user,
+            content: [ReqLLM.Message.ContentPart.text("Now multiply by 2")]
+          }
+        ]
+      }
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: "google/gemini-2.5-flash",
+          stream: false
+        ]
+      }
+
+      updated_request = OpenRouter.encode_body(mock_request)
+      decoded_body = Jason.decode!(updated_request.body)
+
+      messages = decoded_body["messages"]
+      assistant_message = Enum.find(messages, fn msg -> msg["role"] == "assistant" end)
+
+      assert assistant_message != nil
+      assert assistant_message["reasoning_details"] != nil
+      assert is_list(assistant_message["reasoning_details"])
+      assert length(assistant_message["reasoning_details"]) == 1
+
+      [detail] = assistant_message["reasoning_details"]
+      assert detail["type"] == "reasoning.text"
+      assert detail["format"] == "google-gemini-v1"
+      assert detail["text"] == "Let me break down 12 * 7..."
+    end
+
+    test "reasoning_details preserved in full round-trip" do
+      # This is the key integration test: decode -> encode -> verify preservation
+
+      # Step 1: Decode a response with reasoning_details
+      fixture_path =
+        Path.join([
+          __DIR__,
+          "..",
+          "support",
+          "fixtures",
+          "openrouter",
+          "google_gemini_2_5_flash",
+          "reasoning_basic.json"
+        ])
+
+      fixture = File.read!(fixture_path) |> Jason.decode!()
+
+      req = Req.new()
+      resp = %Req.Response{status: 200, body: fixture["response"]["body"]}
+
+      {^req, decoded_resp} = OpenRouter.decode_response({req, resp})
+      first_response = decoded_resp.body
+
+      # Step 2: Use the decoded message in a new context
+      context = %ReqLLM.Context{
+        messages: [
+          %ReqLLM.Message{
+            role: :user,
+            content: [ReqLLM.Message.ContentPart.text("What is 12*7?")]
+          },
+          first_response.message,
+          %ReqLLM.Message{
+            role: :user,
+            content: [ReqLLM.Message.ContentPart.text("Double it")]
+          }
+        ]
+      }
+
+      # Step 3: Encode a new request with this context
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: "google/gemini-2.5-flash",
+          stream: false
+        ]
+      }
+
+      updated_request = OpenRouter.encode_body(mock_request)
+      decoded_body = Jason.decode!(updated_request.body)
+
+      # Step 4: Verify reasoning_details was preserved exactly
+      messages = decoded_body["messages"]
+      assistant_message = Enum.find(messages, fn msg -> msg["role"] == "assistant" end)
+
+      assert assistant_message["reasoning_details"] != nil
+
+      original_details =
+        fixture["response"]["body"]["choices"]
+        |> List.first()
+        |> get_in(["message", "reasoning_details"])
+
+      [encoded_detail] = assistant_message["reasoning_details"]
+      [original_detail] = original_details
+
+      assert encoded_detail["type"] == original_detail["type"]
+      assert encoded_detail["format"] == original_detail["format"]
+      assert encoded_detail["index"] == original_detail["index"]
+      assert encoded_detail["text"] == original_detail["text"]
+    end
+
+    test "empty reasoning_details array not encoded (cleaner wire format)" do
+      message = %ReqLLM.Message{
+        role: :assistant,
+        content: [ReqLLM.Message.ContentPart.text("Hello")],
+        reasoning_details: []
+      }
+
+      context = %ReqLLM.Context{messages: [message]}
+
+      mock_request = %Req.Request{
+        options: [context: context, model: "openai/gpt-4", stream: false]
+      }
+
+      updated_request = OpenRouter.encode_body(mock_request)
+      decoded_body = Jason.decode!(updated_request.body)
+
+      # Empty array should not be included (cleaner)
+      assistant_message = List.first(decoded_body["messages"])
+      refute Map.has_key?(assistant_message, "reasoning_details")
+    end
+
+    test "reasoning_details validation rejects malformed data" do
+      req = Req.new()
+
+      # Malformed: reasoning_details is not a list of maps
+      resp = %Req.Response{
+        status: 200,
+        body: %{
+          "choices" => [
+            %{
+              "message" => %{
+                "role" => "assistant",
+                "content" => "Answer",
+                "reasoning_details" => ["not", "maps"]
+              },
+              "finish_reason" => "stop"
+            }
+          ],
+          "usage" => %{"prompt_tokens" => 10, "completion_tokens" => 5, "total_tokens" => 15}
+        }
+      }
+
+      {^req, decoded_resp} = OpenRouter.decode_response({req, resp})
+
+      # Should return nil for malformed data (defensive)
+      response = decoded_resp.body
+      assert response.message.reasoning_details == nil
+    end
+
+    test "reasoning_details attached to last context message, not duplicated" do
+      fixture_path =
+        Path.join([
+          __DIR__,
+          "..",
+          "support",
+          "fixtures",
+          "openrouter",
+          "google_gemini_2_5_flash",
+          "reasoning_basic.json"
+        ])
+
+      fixture = File.read!(fixture_path) |> Jason.decode!()
+
+      context = %ReqLLM.Context{
+        messages: [
+          %ReqLLM.Message{
+            role: :user,
+            content: [ReqLLM.Message.ContentPart.text("What is 12*7?")]
+          }
+        ]
+      }
+
+      req = %Req.Request{
+        options: [context: context, model: "google/gemini-2.5-flash", stream: false]
+      }
+
+      resp = %Req.Response{status: 200, body: fixture["response"]["body"]}
+
+      {^req, decoded_resp} = OpenRouter.decode_response({req, resp})
+      response = decoded_resp.body
+
+      assert %ReqLLM.Message{reasoning_details: details} = response.message
+      assert is_list(details) and details != []
+
+      assert %ReqLLM.Context{messages: msgs} = response.context
+      assert length(msgs) == 2
+
+      [user_msg, assistant_msg] = msgs
+      assert user_msg.role == :user
+      assert assistant_msg.role == :assistant
+      assert assistant_msg.reasoning_details == details
+    end
+
+    test "skips non-OpenRouter reasoning details with warning during encoding" do
+      import ExUnit.CaptureLog
+
+      message_with_foreign_reasoning = %ReqLLM.Message{
+        role: :assistant,
+        content: [ReqLLM.Message.ContentPart.text("The answer is 84")],
+        reasoning_details: [
+          %ReqLLM.Message.ReasoningDetails{
+            text: "Anthropic thinking content",
+            provider: :anthropic,
+            format: "anthropic-thinking-v1",
+            index: 0,
+            provider_data: %{"type" => "thinking"}
+          }
+        ]
+      }
+
+      context = %ReqLLM.Context{
+        messages: [
+          %ReqLLM.Message{
+            role: :user,
+            content: [ReqLLM.Message.ContentPart.text("What is 12*7?")]
+          },
+          message_with_foreign_reasoning
+        ]
+      }
+
+      mock_request = %Req.Request{
+        options: [context: context, model: "openai/gpt-4", stream: false]
+      }
+
+      log =
+        capture_log(fn ->
+          updated_request = OpenRouter.encode_body(mock_request)
+          decoded_body = Jason.decode!(updated_request.body)
+
+          assistant_message =
+            Enum.find(decoded_body["messages"], fn msg -> msg["role"] == "assistant" end)
+
+          refute Map.has_key?(assistant_message, "reasoning_details")
+        end)
+
+      assert log =~ "Skipping non-OpenRouter reasoning detail from provider:"
+      assert log =~ "anthropic"
+    end
+
+    test "encodes ReasoningDetails with signature field" do
+      message_with_signature = %ReqLLM.Message{
+        role: :assistant,
+        content: [ReqLLM.Message.ContentPart.text("The answer")],
+        reasoning_details: [
+          %ReqLLM.Message.ReasoningDetails{
+            text: "Reasoning text",
+            signature: "encrypted-sig-token",
+            encrypted?: true,
+            provider: :openrouter,
+            format: "google-gemini-v1",
+            index: 0,
+            provider_data: %{"type" => "reasoning.text"}
+          }
+        ]
+      }
+
+      context = %ReqLLM.Context{
+        messages: [
+          %ReqLLM.Message{
+            role: :user,
+            content: [ReqLLM.Message.ContentPart.text("Question")]
+          },
+          message_with_signature
+        ]
+      }
+
+      mock_request = %Req.Request{
+        options: [context: context, model: "google/gemini-2.5-flash", stream: false]
+      }
+
+      updated_request = OpenRouter.encode_body(mock_request)
+      decoded_body = Jason.decode!(updated_request.body)
+
+      assistant_message =
+        Enum.find(decoded_body["messages"], fn msg -> msg["role"] == "assistant" end)
+
+      [detail] = assistant_message["reasoning_details"]
+      assert detail["signature"] == "encrypted-sig-token"
+      assert detail["text"] == "Reasoning text"
     end
   end
 end

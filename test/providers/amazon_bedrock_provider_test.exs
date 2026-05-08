@@ -401,6 +401,172 @@ defmodule ReqLLM.Providers.AmazonBedrockProviderTest do
       message_crc::32
     >>
   end
+
+  describe "ResponseBuilder - streaming reasoning_details extraction" do
+    alias ReqLLM.Provider.Defaults.ResponseBuilder
+
+    test "extracts reasoning_details from thinking chunks for Anthropic models" do
+      {:ok, model} = ReqLLM.model("amazon-bedrock:anthropic.claude-3-haiku-20240307-v1:0")
+      context = %ReqLLM.Context{messages: []}
+
+      thinking_meta = %{
+        provider: :anthropic,
+        format: "anthropic-thinking-v1",
+        encrypted?: false,
+        provider_data: %{"type" => "thinking"}
+      }
+
+      chunks = [
+        ReqLLM.StreamChunk.thinking("Let me analyze this step by step", thinking_meta),
+        ReqLLM.StreamChunk.thinking("Considering all factors", thinking_meta),
+        ReqLLM.StreamChunk.text("The answer is 42.")
+      ]
+
+      metadata = %{finish_reason: :stop}
+
+      {:ok, response} =
+        ResponseBuilder.build_response(chunks, metadata, context: context, model: model)
+
+      assert response.message.reasoning_details != nil
+      assert length(response.message.reasoning_details) == 2
+
+      [first, second] = response.message.reasoning_details
+      assert %ReqLLM.Message.ReasoningDetails{} = first
+      assert first.text == "Let me analyze this step by step"
+      assert first.provider == :anthropic
+      assert first.format == "anthropic-thinking-v1"
+      assert first.index == 0
+
+      assert second.text == "Considering all factors"
+      assert second.index == 1
+    end
+
+    test "preserves signature from thinking chunk metadata" do
+      {:ok, model} = ReqLLM.model("amazon-bedrock:anthropic.claude-3-haiku-20240307-v1:0")
+      context = %ReqLLM.Context{messages: []}
+
+      thinking_meta = %{
+        signature: "encrypted-signature-abc123",
+        encrypted?: true,
+        provider: :anthropic,
+        format: "anthropic-thinking-v1",
+        provider_data: %{"type" => "thinking"}
+      }
+
+      chunks = [
+        ReqLLM.StreamChunk.thinking("Encrypted reasoning content", thinking_meta),
+        ReqLLM.StreamChunk.text("Final answer.")
+      ]
+
+      metadata = %{finish_reason: :stop}
+
+      {:ok, response} =
+        ResponseBuilder.build_response(chunks, metadata, context: context, model: model)
+
+      assert response.message.reasoning_details != nil
+      [first] = response.message.reasoning_details
+      assert first.signature == "encrypted-signature-abc123"
+      assert first.encrypted? == true
+    end
+
+    test "returns nil reasoning_details when no thinking chunks" do
+      {:ok, model} = ReqLLM.model("amazon-bedrock:anthropic.claude-3-haiku-20240307-v1:0")
+      context = %ReqLLM.Context{messages: []}
+
+      chunks = [
+        ReqLLM.StreamChunk.text("Just a simple response.")
+      ]
+
+      metadata = %{finish_reason: :stop}
+
+      {:ok, response} =
+        ResponseBuilder.build_response(chunks, metadata, context: context, model: model)
+
+      assert response.message.reasoning_details == nil
+    end
+  end
+
+  describe "Sync flow - reasoning_details extraction" do
+    alias ReqLLM.Providers.AmazonBedrock.Anthropic, as: BedrockAnthropic
+
+    test "extracts reasoning_details from Anthropic response on Bedrock (sync flow)" do
+      anthropic_response_body = %{
+        "id" => "msg_01XFDUDYJgAACzvnptvVoYEL",
+        "type" => "message",
+        "role" => "assistant",
+        "model" => "anthropic.claude-3-haiku-20240307-v1:0",
+        "content" => [
+          %{"type" => "thinking", "thinking" => "Let me think about this carefully"},
+          %{"type" => "thinking", "thinking" => "Analyzing the problem"},
+          %{"type" => "text", "text" => "Here is the answer."}
+        ],
+        "stop_reason" => "end_turn",
+        "usage" => %{
+          "input_tokens" => 15,
+          "output_tokens" => 45
+        }
+      }
+
+      {:ok, response} = BedrockAnthropic.parse_response(anthropic_response_body, [])
+
+      assert response.message.reasoning_details != nil
+      assert length(response.message.reasoning_details) == 2
+
+      [first, second] = response.message.reasoning_details
+      assert first.text == "Let me think about this carefully"
+      assert first.provider == :anthropic
+      assert first.format == "anthropic-thinking-v1"
+      assert first.index == 0
+
+      assert second.text == "Analyzing the problem"
+      assert second.index == 1
+    end
+
+    test "preserves signature from thinking content (sync flow)" do
+      anthropic_response_body = %{
+        "id" => "msg_01XFDUDYJgAACzvnptvVoYEL",
+        "type" => "message",
+        "role" => "assistant",
+        "model" => "anthropic.claude-3-haiku-20240307-v1:0",
+        "content" => [
+          %{"type" => "thinking", "thinking" => "Encrypted thought", "signature" => "sig-abc123"},
+          %{"type" => "text", "text" => "Response."}
+        ],
+        "stop_reason" => "end_turn",
+        "usage" => %{
+          "input_tokens" => 10,
+          "output_tokens" => 30
+        }
+      }
+
+      {:ok, response} = BedrockAnthropic.parse_response(anthropic_response_body, [])
+
+      assert response.message.reasoning_details != nil
+      [first] = response.message.reasoning_details
+      assert first.signature == "sig-abc123"
+    end
+
+    test "returns nil reasoning_details when no thinking content (sync flow)" do
+      anthropic_response_body = %{
+        "id" => "msg_01XFDUDYJgAACzvnptvVoYEL",
+        "type" => "message",
+        "role" => "assistant",
+        "model" => "anthropic.claude-3-haiku-20240307-v1:0",
+        "content" => [
+          %{"type" => "text", "text" => "Just a simple response."}
+        ],
+        "stop_reason" => "end_turn",
+        "usage" => %{
+          "input_tokens" => 10,
+          "output_tokens" => 15
+        }
+      }
+
+      {:ok, response} = BedrockAnthropic.parse_response(anthropic_response_body, [])
+
+      assert response.message.reasoning_details == nil
+    end
+  end
 end
 
 # Test double for Finch

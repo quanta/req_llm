@@ -36,13 +36,19 @@ defmodule ReqLLM.ToolCall do
       }
   """
 
-  use TypedStruct
+  @schema Zoi.struct(__MODULE__, %{
+            id: Zoi.string(),
+            type: Zoi.string() |> Zoi.default("function"),
+            function: Zoi.map()
+          })
 
-  typedstruct enforce: true do
-    field(:id, String.t(), enforce: true)
-    field(:type, String.t(), default: "function", enforce: true)
-    field(:function, %{name: String.t(), arguments: String.t()}, enforce: true)
-  end
+  @type t :: unquote(Zoi.type_spec(@schema))
+
+  @enforce_keys Zoi.Struct.enforce_keys(@schema)
+  defstruct Zoi.Struct.struct_fields(@schema)
+
+  @doc "Returns the Zoi schema for this module"
+  def schema, do: @schema
 
   @doc """
   Create a new ToolCall with OpenAI-compatible structure.
@@ -97,6 +103,67 @@ defmodule ReqLLM.ToolCall do
       {:error, _} -> nil
     end
   end
+
+  @doc """
+  Convert a ToolCall to a flat map with decoded arguments.
+
+  Returns a map with `:id`, `:name`, and `:arguments` keys.
+  Arguments are decoded from JSON; returns empty map if decoding fails.
+
+  ## Examples
+
+      iex> tc = ToolCall.new("call_123", "get_weather", ~s({"location":"Paris"}))
+      iex> ToolCall.to_map(tc)
+      %{id: "call_123", name: "get_weather", arguments: %{"location" => "Paris"}}
+
+      iex> tc = ToolCall.new("call_456", "get_time", "{}")
+      iex> ToolCall.to_map(tc)
+      %{id: "call_456", name: "get_time", arguments: %{}}
+  """
+  @spec to_map(t()) :: %{id: String.t(), name: String.t(), arguments: map()}
+  def to_map(%__MODULE__{id: id, function: %{name: name}} = tc) do
+    %{
+      id: id,
+      name: name,
+      arguments: args_map(tc) || %{}
+    }
+  end
+
+  @doc """
+  Normalize a map or ToolCall to the standard `%{id, name, arguments}` format.
+
+  Accepts ToolCall structs or plain maps with atom/string keys.
+  Arguments are decoded from JSON if provided as a string.
+
+  ## Examples
+
+      iex> ToolCall.from_map(%{"id" => "call_123", "name" => "get_weather", "arguments" => ~s({"location":"Paris"})})
+      %{id: "call_123", name: "get_weather", arguments: %{"location" => "Paris"}}
+
+      iex> tc = ToolCall.new("call_456", "get_time", "{}")
+      iex> ToolCall.from_map(tc)
+      %{id: "call_456", name: "get_time", arguments: %{}}
+  """
+  @spec from_map(t() | map()) :: %{id: String.t(), name: String.t(), arguments: map()}
+  def from_map(%__MODULE__{} = tc), do: to_map(tc)
+
+  def from_map(map) when is_map(map) do
+    %{
+      id: map[:id] || map["id"] || generate_id(),
+      name: map[:name] || map["name"],
+      arguments: parse_arguments(map[:arguments] || map["arguments"] || %{})
+    }
+  end
+
+  defp parse_arguments(args) when is_binary(args) do
+    case Jason.decode(args) do
+      {:ok, parsed} -> parsed
+      {:error, _} -> %{}
+    end
+  end
+
+  defp parse_arguments(args) when is_map(args), do: args
+  defp parse_arguments(_), do: %{}
 
   @doc """
   Check if a ToolCall matches the given function name.

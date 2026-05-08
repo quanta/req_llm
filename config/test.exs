@@ -76,14 +76,14 @@ config :llm_db,
           family: "o1",
           capabilities: %{chat: true, reasoning: %{enabled: true}},
           limits: %{context: 128_000, output: 65_536},
-          extra: %{api: "responses"}
+          extra: %{wire: %{protocol: "openai_responses"}}
         },
         "o3-mini" => %{
           name: "o3-mini",
           family: "o3",
           capabilities: %{chat: true, reasoning: %{enabled: true}},
           limits: %{context: 200_000, output: 100_000},
-          extra: %{api: "responses"}
+          extra: %{wire: %{protocol: "openai_responses"}}
         },
         "o4-mini" => %{
           name: "o4-mini",
@@ -94,28 +94,28 @@ config :llm_db,
             tools: %{enabled: true, streaming: true}
           },
           limits: %{context: 200_000, output: 100_000},
-          extra: %{api: "responses"}
+          extra: %{wire: %{protocol: "openai_responses"}}
         },
         "gpt-5" => %{
           name: "GPT-5",
           family: "gpt-5",
           capabilities: %{chat: true, tools: %{enabled: true}},
           limits: %{context: 200_000, output: 32_768},
-          extra: %{api: "responses"}
+          extra: %{wire: %{protocol: "openai_responses"}}
         },
         "gpt-5-mini" => %{
           name: "GPT-5 mini",
           family: "gpt-5",
           capabilities: %{chat: true, tools: %{enabled: true}},
           limits: %{context: 128_000, output: 16_384},
-          extra: %{api: "responses"}
+          extra: %{wire: %{protocol: "openai_responses"}}
         },
         "gpt-5-nano" => %{
           name: "GPT-5 nano",
           family: "gpt-5",
           capabilities: %{chat: true, tools: %{enabled: true}},
           limits: %{context: 64_000, output: 8192},
-          extra: %{api: "responses"}
+          extra: %{wire: %{protocol: "openai_responses"}}
         },
         "text-embedding-3-small" => %{
           name: "Text Embedding 3 Small",
@@ -249,6 +249,17 @@ config :llm_db,
           capabilities: %{chat: true, tools: %{enabled: true}},
           limits: %{context: 200_000, output: 4096},
           aliases: []
+        },
+        "google/gemini-3-flash-preview" => %{
+          name: "Gemini 3 Flash Preview",
+          family: "gemini-3",
+          capabilities: %{
+            chat: true,
+            tools: %{enabled: true, streaming: true},
+            reasoning: %{enabled: true}
+          },
+          limits: %{context: 1_048_576, output: 65_535},
+          cost: %{input: 0.5, output: 3.0}
         }
       }
     ],
@@ -268,6 +279,36 @@ config :llm_db,
           family: "command",
           capabilities: %{chat: true},
           limits: %{context: 4096, output: 4096}
+        },
+        "cohere.embed-english-v3" => %{
+          name: "Cohere Embed English v3",
+          family: "embed",
+          capabilities: %{embeddings: true}
+        }
+      }
+    ],
+    zenmux: [
+      name: "Zenmux",
+      base_url: "https://zenmux.ai/api/v1",
+      env: ["ZENMUX_API_KEY"],
+      models: %{
+        "openai/gpt-4" => %{
+          name: "GPT-4 (Zenmux)",
+          family: "gpt-4",
+          capabilities: %{chat: true, tools: %{enabled: true}},
+          limits: %{context: 8192, output: 8192}
+        },
+        "openai/o1" => %{
+          name: "o1 (Zenmux)",
+          family: "o1",
+          capabilities: %{chat: true, reasoning: %{enabled: true}},
+          limits: %{context: 128_000, output: 65_536}
+        },
+        "xiaomi/mimo-v2-flash" => %{
+          name: "Mimo V2 Flash",
+          family: "mimo",
+          capabilities: %{chat: true, tools: %{enabled: true}},
+          limits: %{context: 32_768, output: 4096}
         }
       }
     ]
@@ -281,9 +322,12 @@ config :logger, :console,
 config :req_llm, :sample_embedding_models, ~w(
     openai:text-embedding-3-small
     google:text-embedding-004
+    azure:text-embedding-3-small
+    amazon_bedrock:cohere.embed-english-v3
   )
 config :req_llm, :sample_text_models, ~w(
     anthropic:claude-3-5-haiku-20241022
+    anthropic:claude-haiku-4-5
     openai:gpt-4o-mini
     google:gemini-2.0-flash
   )

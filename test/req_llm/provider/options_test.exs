@@ -209,6 +209,27 @@ defmodule ReqLLM.Provider.OptionsTest do
       refute Keyword.has_key?(processed, :max_tokens)
     end
 
+    test "uses provider base_url when model has no base_url" do
+      model = %LLMDB.Model{provider: :mock, id: "test-model"}
+      opts = []
+
+      assert {:ok, processed} = Options.process(MockProvider, :chat, model, opts)
+      assert processed[:base_url] == "https://api.mock.com"
+    end
+
+    test "model base_url overrides provider base_url" do
+      model = %LLMDB.Model{
+        provider: :mock,
+        id: "test-model",
+        base_url: "http://localhost:8001/v1"
+      }
+
+      opts = []
+
+      assert {:ok, processed} = Options.process(MockProvider, :chat, model, opts)
+      assert processed[:base_url] == "http://localhost:8001/v1"
+    end
+
     test "works across different providers" do
       # Test with MockProvider
       model1 = %LLMDB.Model{provider: :mock, id: "test-model", limits: %{output: 50}}
@@ -272,6 +293,115 @@ defmodule ReqLLM.Provider.OptionsTest do
       assert {:ok, processed} = Options.process(MockProvider, :chat, model, opts)
       assert processed[:temperature] == 0.7
       refute Keyword.has_key?(processed, :req_http_options)
+    end
+  end
+
+  defmodule ProviderOptionsTranslator do
+    @behaviour ReqLLM.Provider
+
+    def provider_id, do: :translator
+    def default_base_url, do: "https://api.translator.com"
+    def supported_provider_options, do: [:custom_option, :deprecated_option, :removable_option]
+
+    def provider_schema do
+      NimbleOptions.new!(
+        custom_option: [type: :string, doc: "Custom provider option"],
+        deprecated_option: [type: :string, doc: "Will be renamed to new_option"],
+        removable_option: [type: :string, doc: "Will be removed during translation"]
+      )
+    end
+
+    def translate_options(_operation, _model, opts) do
+      opts =
+        case Keyword.pop(opts, :deprecated_option) do
+          {nil, rest} -> rest
+          {value, rest} -> Keyword.put(rest, :new_option, "translated_" <> value)
+        end
+
+      opts =
+        case Keyword.pop(opts, :removable_option) do
+          {nil, rest} -> rest
+          {_value, rest} -> rest
+        end
+
+      opts =
+        case Keyword.get(opts, :custom_option) do
+          nil -> opts
+          value -> Keyword.put(opts, :custom_option, String.upcase(value))
+        end
+
+      {opts, []}
+    end
+
+    def attach(_request, _model, _opts), do: nil
+    def prepare_request(_operation, _model, _input, _opts), do: {:error, :not_implemented}
+    def encode_body(_request), do: nil
+    def decode_response(_response), do: nil
+  end
+
+  describe "Options.process/4 - translate_options preserves provider_options changes" do
+    test "translate_options can modify provider_options values" do
+      model = %LLMDB.Model{provider: :translator, id: "test-model"}
+
+      opts = [
+        temperature: 0.7,
+        provider_options: [custom_option: "lowercase"]
+      ]
+
+      assert {:ok, processed} = Options.process(ProviderOptionsTranslator, :chat, model, opts)
+      assert processed[:temperature] == 0.7
+      assert processed[:provider_options][:custom_option] == "LOWERCASE"
+    end
+
+    test "translate_options can remove provider_options keys" do
+      model = %LLMDB.Model{provider: :translator, id: "test-model"}
+
+      opts = [
+        temperature: 0.7,
+        provider_options: [removable_option: "will be removed", custom_option: "keep"]
+      ]
+
+      assert {:ok, processed} = Options.process(ProviderOptionsTranslator, :chat, model, opts)
+      assert processed[:temperature] == 0.7
+      refute Keyword.has_key?(processed[:provider_options], :removable_option)
+      assert processed[:provider_options][:custom_option] == "KEEP"
+    end
+
+    test "translate_options removes provider_options key when all options removed" do
+      model = %LLMDB.Model{provider: :translator, id: "test-model"}
+
+      opts = [
+        temperature: 0.7,
+        provider_options: [removable_option: "will be removed"]
+      ]
+
+      assert {:ok, processed} = Options.process(ProviderOptionsTranslator, :chat, model, opts)
+      assert processed[:temperature] == 0.7
+      refute Keyword.has_key?(processed, :provider_options)
+    end
+
+    test "empty provider_options still works normally" do
+      model = %LLMDB.Model{provider: :translator, id: "test-model"}
+      opts = [temperature: 0.7]
+
+      assert {:ok, processed} = Options.process(ProviderOptionsTranslator, :chat, model, opts)
+      assert processed[:temperature] == 0.7
+      refute Keyword.has_key?(processed, :provider_options)
+    end
+
+    test "standard options still work normally alongside provider_options" do
+      model = %LLMDB.Model{provider: :translator, id: "test-model"}
+
+      opts = [
+        temperature: 0.7,
+        max_tokens: 1000,
+        provider_options: [custom_option: "test"]
+      ]
+
+      assert {:ok, processed} = Options.process(ProviderOptionsTranslator, :chat, model, opts)
+      assert processed[:temperature] == 0.7
+      assert processed[:max_tokens] == 1000
+      assert processed[:provider_options][:custom_option] == "TEST"
     end
   end
 

@@ -84,6 +84,18 @@ Passed via `:provider_options` keyword:
 - **Purpose**: Number of top log probabilities to return
 - **Example**: `provider_options: [openrouter_top_logprobs: 5]`
 
+### Usage & Plugins
+
+#### `openrouter_usage`
+- **Type**: Map
+- **Purpose**: Configure usage reporting
+- **Example**: `provider_options: [openrouter_usage: %{include: true}]`
+
+#### `openrouter_plugins`
+- **Type**: List of maps
+- **Purpose**: Enable OpenRouter plugins (e.g., web search)
+- **Example**: `provider_options: [openrouter_plugins: [%{id: "web"}]]`
+
 ### App Attribution
 
 #### `app_referer`
@@ -97,6 +109,36 @@ Passed via `:provider_options` keyword:
 - **Purpose**: X-Title header for app title
 - **Benefit**: App ranking in OpenRouter
 - **Example**: `provider_options: [app_title: "My Awesome App"]`
+
+## Prompt Caching (Anthropic Models)
+
+When using Anthropic models via OpenRouter, you can enable prompt caching by adding `cache_control` metadata to your `ContentPart` structs:
+
+```elixir
+alias ReqLLM.Message.ContentPart
+
+# Create content with cache_control metadata
+system_content = ContentPart.text(
+  "You are a helpful assistant with extensive knowledge...",
+  %{cache_control: %{type: "ephemeral"}}
+)
+
+# Use in a message
+context = ReqLLM.Context.new([
+  ReqLLM.Context.system([system_content]),
+  ReqLLM.Context.user("Hello!")
+])
+
+# The cache_control will be passed through to Anthropic
+{:ok, response} = ReqLLM.generate_text(
+  "openrouter:anthropic/claude-sonnet-4-20250514",
+  context
+)
+```
+
+The `cache_control` metadata is passed directly to the underlying Anthropic API, enabling prompt caching for system prompts, tools, and message content.
+
+> **Note**: This differs from the direct Anthropic provider which uses `anthropic_prompt_cache: true` option. Through OpenRouter, you have fine-grained control over exactly which content blocks get cached.
 
 ## Model Discovery
 

@@ -63,6 +63,15 @@ defmodule ReqLLM.Providers.Anthropic do
       type: :string,
       doc: "TTL for cache (\"1h\" for one hour; omit for default ~5m)"
     ],
+    anthropic_cache_messages: [
+      type: {:or, [:boolean, :integer]},
+      doc: """
+      Add cache breakpoint at a message position (requires anthropic_prompt_cache: true).
+      - `true` or `-1` - last message
+      - `-2` - second-to-last, `-3` - third-to-last, etc.
+      - `0` - first message, `1` - second, etc.
+      """
+    ],
     anthropic_structured_output_mode: [
       type: {:in, [:auto, :json_schema, :tool_strict]},
       default: :auto,
@@ -80,6 +89,26 @@ defmodule ReqLLM.Providers.Anthropic do
     anthropic_beta: [
       type: {:list, :string},
       doc: "Internal use: beta feature flags"
+    ],
+    web_search: [
+      type: :map,
+      doc: """
+      Enable web search tool with optional configuration:
+      - `max_uses` - Limit the number of searches per request (integer)
+      - `allowed_domains` - List of domains to include (list of strings)
+      - `blocked_domains` - List of domains to exclude (list of strings)
+      - `user_location` - Map with keys: type, city, region, country, timezone
+
+      Example: %{max_uses: 5, allowed_domains: ["example.com"]}
+      """
+    ],
+    context_management: [
+      type: :map,
+      doc: "Context management configuration for tool result and thinking block clearing"
+    ],
+    container: [
+      type: :map,
+      doc: "Container configuration for skills and code execution"
     ]
   ]
 
@@ -101,9 +130,11 @@ defmodule ReqLLM.Providers.Anthropic do
 
   # Canonical reasoning effort token budgets for Anthropic models
   # These values are used across all providers hosting Anthropic models
+  @reasoning_budget_minimal 512
   @reasoning_budget_low 1_024
   @reasoning_budget_medium 2_048
   @reasoning_budget_high 4_096
+  @reasoning_budget_xhigh 8_192
 
   @impl ReqLLM.Provider
   def prepare_request(:chat, model_spec, prompt, opts) do
@@ -177,7 +208,11 @@ defmodule ReqLLM.Providers.Anthropic do
 
   defp prepare_json_schema_request(model_spec, prompt, compiled_schema, opts) do
     json_schema = ReqLLM.Schema.to_json(compiled_schema.schema)
-    json_schema = enforce_strict_schema_requirements(json_schema)
+
+    json_schema =
+      json_schema
+      |> strip_constraints_recursive()
+      |> enforce_strict_schema_requirements()
 
     opts_with_format =
       opts
@@ -210,7 +245,11 @@ defmodule ReqLLM.Providers.Anthropic do
   @spec prepare_strict_tool_request(LLMDB.Model.t() | String.t(), any(), any(), keyword()) ::
           {:ok, Req.Request.t()} | {:error, any()}
   defp prepare_strict_tool_request(model_spec, prompt, compiled_schema, opts) do
-    schema = enforce_strict_schema_requirements(compiled_schema.schema)
+    schema =
+      compiled_schema.schema
+      |> ReqLLM.Schema.to_json()
+      |> strip_constraints_recursive()
+      |> enforce_strict_schema_requirements()
 
     case ReqLLM.Tool.new(
            name: "structured_output",
@@ -287,12 +326,32 @@ defmodule ReqLLM.Providers.Anthropic do
   @impl ReqLLM.Provider
   def extract_usage(body, _model) when is_map(body) do
     case body do
-      %{"usage" => usage} -> {:ok, usage}
-      _ -> {:error, :no_usage_found}
+      %{"usage" => usage} ->
+        usage = maybe_add_anthropic_tool_usage(usage)
+        {:ok, usage}
+
+      _ ->
+        {:error, :no_usage_found}
     end
   end
 
   def extract_usage(_, _), do: {:error, :invalid_body}
+
+  defp maybe_add_anthropic_tool_usage(usage) when is_map(usage) do
+    server_tool_use = Map.get(usage, "server_tool_use") || Map.get(usage, :server_tool_use) || %{}
+
+    web_search =
+      Map.get(server_tool_use, "web_search_requests") ||
+        Map.get(server_tool_use, :web_search_requests)
+
+    if is_number(web_search) and web_search > 0 do
+      Map.put(usage, :tool_usage, ReqLLM.Usage.Tool.build(:web_search, web_search))
+    else
+      usage
+    end
+  end
+
+  defp maybe_add_anthropic_tool_usage(usage), do: usage
 
   # ========================================================================
   # Shared Request Building Helpers (used by both Req and Finch paths)
@@ -326,6 +385,8 @@ defmodule ReqLLM.Providers.Anthropic do
     |> maybe_add_tools(opts)
     |> maybe_apply_prompt_caching(opts)
     |> maybe_add_output_format(opts)
+    |> maybe_add_context_management(opts)
+    |> maybe_add_container(opts)
   end
 
   defp build_request_url(opts) do
@@ -528,6 +589,7 @@ defmodule ReqLLM.Providers.Anthropic do
       body
       |> maybe_cache_tools(cache_meta)
       |> maybe_cache_system(cache_meta)
+      |> maybe_cache_message(cache_meta, opts)
     else
       body
     end
@@ -589,6 +651,94 @@ defmodule ReqLLM.Providers.Anthropic do
     end
   end
 
+  defp maybe_cache_message(body, cache_meta, opts) do
+    case get_option(opts, :anthropic_cache_messages, false) do
+      false ->
+        body
+
+      true ->
+        # true is alias for -1 (last message)
+        do_cache_message_at(body, cache_meta, -1)
+
+      offset when is_integer(offset) ->
+        do_cache_message_at(body, cache_meta, offset)
+
+      _ ->
+        body
+    end
+  end
+
+  defp do_cache_message_at(body, cache_meta, offset) do
+    # Handle nil explicitly (Map.get default only applies when key is absent)
+    messages = Map.get(body, :messages, []) || []
+    len = length(messages)
+
+    # Standard negative indexing: -1 = last, -2 = second-to-last, etc.
+    # Non-negative: 0 = first, 1 = second, etc.
+    index = if offset < 0, do: len + offset, else: offset
+
+    # Bounds check - silently return unchanged if out of bounds
+    if index < 0 or index >= len do
+      body
+    else
+      {before, [target | after_list]} = Enum.split(messages, index)
+      updated = add_cache_to_message_content(target, cache_meta)
+      Map.put(body, :messages, before ++ [updated | after_list])
+    end
+  end
+
+  defp add_cache_to_message_content(msg, cache_meta) do
+    content = Map.get(msg, :content) || Map.get(msg, "content")
+
+    updated_content =
+      case content do
+        # String content - convert to content block with cache_control
+        text when is_binary(text) ->
+          [%{type: "text", text: text, cache_control: cache_meta}]
+
+        # List content - add cache_control to last block
+        blocks when is_list(blocks) and blocks != [] ->
+          blocks
+          |> Enum.reverse()
+          |> case do
+            [last | rest] ->
+              updated_last =
+                if Map.has_key?(last, :cache_control) or Map.has_key?(last, "cache_control") do
+                  last
+                else
+                  Map.put(last, :cache_control, cache_meta)
+                end
+
+              Enum.reverse([updated_last | rest])
+
+            [] ->
+              []
+          end
+
+        # Expected empty cases - return as-is
+        nil ->
+          nil
+
+        [] ->
+          []
+
+        # Unexpected type - log and return as-is
+        other ->
+          Logger.debug(
+            "Unexpected content type for message cache_control injection: #{inspect(other)}"
+          )
+
+          other
+      end
+
+    # Preserve key type (atom or string)
+    if Map.has_key?(msg, :content) do
+      Map.put(msg, :content, updated_content)
+    else
+      Map.put(msg, "content", updated_content)
+    end
+  end
+
   defp add_basic_options(body, request_options) do
     body =
       Enum.reduce(@body_options, body, fn key, acc ->
@@ -604,12 +754,34 @@ defmodule ReqLLM.Providers.Anthropic do
   defp maybe_add_tools(body, options) do
     tools = get_option(options, :tools, [])
 
-    case tools do
+    # Check for web_search in both top-level options and provider_options
+    web_search_config =
+      get_option(options, :web_search) ||
+        get_option(get_option(options, :provider_options, []), :web_search)
+
+    # Build the tools list
+    all_tools =
+      case {tools, web_search_config} do
+        {[], nil} ->
+          []
+
+        {tools, nil} when is_list(tools) ->
+          Enum.map(tools, &tool_to_anthropic_format/1)
+
+        {[], web_search_config} when is_map(web_search_config) ->
+          [build_web_search_tool(web_search_config)]
+
+        {tools, web_search_config} when is_list(tools) and is_map(web_search_config) ->
+          Enum.map(tools, &tool_to_anthropic_format/1) ++
+            [build_web_search_tool(web_search_config)]
+      end
+
+    case all_tools do
       [] ->
         body
 
-      tools when is_list(tools) ->
-        body = Map.put(body, :tools, Enum.map(tools, &tool_to_anthropic_format/1))
+      tools_list ->
+        body = Map.put(body, :tools, tools_list)
 
         case get_option(options, :tool_choice) do
           nil -> body
@@ -645,16 +817,81 @@ defmodule ReqLLM.Providers.Anthropic do
   Convert a ReqLLM.Tool to Anthropic's tool format.
 
   This is made public so that Bedrock and Vertex formatters can reuse it.
+
+  For custom tool types (like memory_20250818), generates a minimal format
+  with just type and name.
   """
   def tool_to_anthropic_format(tool) do
-    schema = ReqLLM.Tool.to_schema(tool, :openai)
+    case tool.tool_type do
+      nil ->
+        # Standard function tool
+        schema = ReqLLM.Tool.to_schema(tool, :openai)
 
-    %{
-      name: schema["function"]["name"],
-      description: schema["function"]["description"],
-      input_schema: schema["function"]["parameters"]
-    }
+        base = %{
+          name: schema["function"]["name"],
+          description: schema["function"]["description"],
+          input_schema: schema["function"]["parameters"]
+        }
+
+        base = if tool.defer_loading, do: Map.put(base, :defer_loading, true), else: base
+
+        # Programmatic tool calling: opt this tool into being callable from
+        # within Anthropic's code-execution sandbox.
+        case tool.allowed_callers do
+          callers when is_list(callers) and callers != [] ->
+            Map.put(base, :allowed_callers, callers)
+
+          _ ->
+            base
+        end
+
+      custom_type ->
+        # Custom tool type (e.g., memory_20250818, advisor_20260301)
+        # These tools only need type and name, plus any provider_options the
+        # specific tool type requires (e.g., advisor needs `model`).
+        base = %{
+          type: custom_type,
+          name: tool.name
+        }
+
+        case tool.provider_options do
+          opts when is_map(opts) and map_size(opts) > 0 ->
+            Map.merge(base, opts)
+
+          _ ->
+            base
+        end
+    end
   end
+
+  # Builds a web search tool definition for Anthropic API.
+  #
+  # ## Parameters
+  #   * `config` - Map with optional keys:
+  #     * `:max_uses` - Integer limiting the number of searches per request
+  #     * `:allowed_domains` - List of domains to include in results
+  #     * `:blocked_domains` - List of domains to exclude from results
+  #     * `:user_location` - Map with keys: type, city, region, country, timezone
+  defp build_web_search_tool(config) when is_map(config) do
+    base_tool = %{
+      type: "web_search_20250305",
+      name: "web_search"
+    }
+
+    # Add optional parameters if present (handle both atom and string keys)
+    base_tool
+    |> maybe_put_web_search(:max_uses, get_web_search_option(config, :max_uses))
+    |> maybe_put_web_search(:allowed_domains, get_web_search_option(config, :allowed_domains))
+    |> maybe_put_web_search(:blocked_domains, get_web_search_option(config, :blocked_domains))
+    |> maybe_put_web_search(:user_location, get_web_search_option(config, :user_location))
+  end
+
+  defp get_web_search_option(config, key) do
+    Map.get(config, key) || Map.get(config, Atom.to_string(key))
+  end
+
+  defp maybe_put_web_search(tool, _key, nil), do: tool
+  defp maybe_put_web_search(tool, key, value), do: Map.put(tool, key, value)
 
   @doc """
   Maps reasoning effort levels to token budgets.
@@ -674,12 +911,18 @@ defmodule ReqLLM.Providers.Anthropic do
       iex> ReqLLM.Providers.Anthropic.map_reasoning_effort_to_budget("medium")
       2048
   """
+  def map_reasoning_effort_to_budget(:none), do: nil
+  def map_reasoning_effort_to_budget(:minimal), do: @reasoning_budget_minimal
   def map_reasoning_effort_to_budget(:low), do: @reasoning_budget_low
   def map_reasoning_effort_to_budget(:medium), do: @reasoning_budget_medium
   def map_reasoning_effort_to_budget(:high), do: @reasoning_budget_high
+  def map_reasoning_effort_to_budget(:xhigh), do: @reasoning_budget_xhigh
+  def map_reasoning_effort_to_budget("none"), do: map_reasoning_effort_to_budget(:none)
+  def map_reasoning_effort_to_budget("minimal"), do: map_reasoning_effort_to_budget(:minimal)
   def map_reasoning_effort_to_budget("low"), do: map_reasoning_effort_to_budget(:low)
   def map_reasoning_effort_to_budget("medium"), do: map_reasoning_effort_to_budget(:medium)
   def map_reasoning_effort_to_budget("high"), do: map_reasoning_effort_to_budget(:high)
+  def map_reasoning_effort_to_budget("xhigh"), do: map_reasoning_effort_to_budget(:xhigh)
   def map_reasoning_effort_to_budget(_), do: @reasoning_budget_medium
 
   defp translate_reasoning_effort(opts) do
@@ -687,6 +930,17 @@ defmodule ReqLLM.Providers.Anthropic do
     {reasoning_budget, opts} = Keyword.pop(opts, :reasoning_token_budget)
 
     case reasoning_effort do
+      :none ->
+        opts
+
+      :minimal ->
+        budget = reasoning_budget || map_reasoning_effort_to_budget(:minimal)
+
+        opts
+        |> Keyword.put(:thinking, %{type: "enabled", budget_tokens: budget})
+        |> adjust_max_tokens_for_thinking(budget)
+        |> adjust_top_p_for_thinking()
+
       :low ->
         budget = reasoning_budget || map_reasoning_effort_to_budget(:low)
 
@@ -705,6 +959,14 @@ defmodule ReqLLM.Providers.Anthropic do
 
       :high ->
         budget = reasoning_budget || map_reasoning_effort_to_budget(:high)
+
+        opts
+        |> Keyword.put(:thinking, %{type: "enabled", budget_tokens: budget})
+        |> adjust_max_tokens_for_thinking(budget)
+        |> adjust_top_p_for_thinking()
+
+      :xhigh ->
+        budget = reasoning_budget || map_reasoning_effort_to_budget(:xhigh)
 
         opts
         |> Keyword.put(:thinking, %{type: "enabled", budget_tokens: budget})
@@ -1033,6 +1295,26 @@ defmodule ReqLLM.Providers.Anthropic do
 
   defp enforce_strict_schema_requirements(schema), do: schema
 
+  defp strip_constraints_recursive(schema) when is_map(schema) do
+    schema
+    |> Map.drop(["minimum", "maximum", "minLength", "maxLength"])
+    |> Map.new(fn
+      {"properties", props} when is_map(props) ->
+        {"properties", Map.new(props, fn {k, v} -> {k, strip_constraints_recursive(v)} end)}
+
+      {"items", items} when is_map(items) ->
+        {"items", strip_constraints_recursive(items)}
+
+      {k, v} when is_map(v) ->
+        {k, strip_constraints_recursive(v)}
+
+      {k, v} ->
+        {k, v}
+    end)
+  end
+
+  defp strip_constraints_recursive(value), do: value
+
   defp maybe_add_output_format(body, opts) do
     provider_opts = get_option(opts, :provider_options, [])
 
@@ -1042,6 +1324,30 @@ defmodule ReqLLM.Providers.Anthropic do
     case output_format do
       nil -> body
       format -> Map.put(body, :output_format, format)
+    end
+  end
+
+  defp maybe_add_context_management(body, opts) do
+    context_management =
+      get_option(opts, :context_management) ||
+        get_option(get_option(opts, :provider_options, []), :context_management)
+
+    case context_management do
+      nil -> body
+      config when is_map(config) -> Map.put(body, :context_management, config)
+      _ -> body
+    end
+  end
+
+  defp maybe_add_container(body, opts) do
+    container =
+      get_option(opts, :container) ||
+        get_option(get_option(opts, :provider_options, []), :container)
+
+    case container do
+      nil -> body
+      config when is_map(config) -> Map.put(body, :container, config)
+      _ -> body
     end
   end
 end

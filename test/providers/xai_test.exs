@@ -499,6 +499,7 @@ defmodule ReqLLM.Providers.XAITest do
       }
 
       updated_request = XAI.encode_body(mock_request)
+      assert_no_duplicate_json_keys(updated_request.body)
       decoded = Jason.decode!(updated_request.body)
 
       assert decoded["model"] == "grok-3"
@@ -530,6 +531,7 @@ defmodule ReqLLM.Providers.XAITest do
       }
 
       updated_request = XAI.encode_body(mock_request)
+      assert_no_duplicate_json_keys(updated_request.body)
       decoded = Jason.decode!(updated_request.body)
 
       assert is_list(decoded["tools"])
@@ -550,6 +552,7 @@ defmodule ReqLLM.Providers.XAITest do
       }
 
       updated_request = XAI.encode_body(mock_request)
+      assert_no_duplicate_json_keys(updated_request.body)
       decoded = Jason.decode!(updated_request.body)
 
       assert decoded["response_format"] == %{"type" => "json_object"}
@@ -566,17 +569,18 @@ defmodule ReqLLM.Providers.XAITest do
           parallel_tool_calls: false,
           max_completion_tokens: 1024,
           reasoning_effort: "low",
-          search_parameters: %{mode: "on"}
+          xai_tools: [%{type: "web_search"}]
         ]
       }
 
       updated_request = XAI.encode_body(mock_request)
+      assert_no_duplicate_json_keys(updated_request.body)
       decoded = Jason.decode!(updated_request.body)
 
       assert decoded["parallel_tool_calls"] == false
       assert decoded["max_completion_tokens"] == 1024
       assert decoded["reasoning_effort"] == "low"
-      assert decoded["search_parameters"]["mode"] == "on"
+      assert Enum.any?(decoded["tools"], fn tool -> tool["type"] == "web_search" end)
     end
   end
 
@@ -592,12 +596,13 @@ defmodule ReqLLM.Providers.XAITest do
       assert hd(warnings) =~ "max_completion_tokens"
     end
 
-    test "handles web_search_options -> search_parameters alias" do
+    test "handles web_search_options -> xai_tools alias" do
       {:ok, model} = ReqLLM.model("xai:grok-3")
       opts = [web_search_options: %{mode: "auto"}]
       {translated_opts, warnings} = XAI.translate_options(:chat, model, opts)
 
-      assert Keyword.get(translated_opts, :search_parameters) == %{mode: "auto"}
+      xai_tools = Keyword.get(translated_opts, :xai_tools, [])
+      assert Enum.any?(xai_tools, fn tool -> tool["type"] == "web_search" end)
       refute Keyword.has_key?(translated_opts, :web_search_options)
       assert length(warnings) == 1
     end
@@ -660,6 +665,69 @@ defmodule ReqLLM.Providers.XAITest do
 
       {:error, :invalid_body} = XAI.extract_usage("invalid", model)
       {:error, :invalid_body} = XAI.extract_usage(nil, model)
+    end
+  end
+
+  describe "attachment validation" do
+    test "accepts image attachments" do
+      {:ok, model} = ReqLLM.model("xai:grok-3")
+
+      image_part = ReqLLM.Message.ContentPart.file(<<1, 2, 3>>, "image.png", "image/png")
+      message = %ReqLLM.Message{role: :user, content: [image_part]}
+      context = %ReqLLM.Context{messages: [message]}
+
+      {:ok, _request} = XAI.prepare_request(:chat, model, context, [])
+    end
+
+    test "accepts jpeg, gif, and webp attachments" do
+      {:ok, model} = ReqLLM.model("xai:grok-3")
+
+      for mime <- ~w(image/jpeg image/gif image/webp) do
+        part = ReqLLM.Message.ContentPart.file(<<1, 2, 3>>, "image", mime)
+        message = %ReqLLM.Message{role: :user, content: [part]}
+        context = %ReqLLM.Context{messages: [message]}
+
+        assert {:ok, _request} = XAI.prepare_request(:chat, model, context, [])
+      end
+    end
+
+    test "rejects PDF attachments with clear error" do
+      {:ok, model} = ReqLLM.model("xai:grok-3")
+
+      pdf_part = ReqLLM.Message.ContentPart.file(<<1, 2, 3>>, "doc.pdf", "application/pdf")
+      message = %ReqLLM.Message{role: :user, content: [pdf_part]}
+      context = %ReqLLM.Context{messages: [message]}
+
+      {:error, error} = XAI.prepare_request(:chat, model, context, [])
+
+      assert %ReqLLM.Error.Invalid.Parameter{} = error
+      assert error.parameter =~ "only supports image attachments"
+      assert error.parameter =~ "application/pdf"
+      assert error.parameter =~ "Anthropic or Google"
+    end
+
+    test "rejects text file attachments" do
+      {:ok, model} = ReqLLM.model("xai:grok-3")
+
+      text_part = ReqLLM.Message.ContentPart.file("content", "file.txt", "text/plain")
+      message = %ReqLLM.Message{role: :user, content: [text_part]}
+      context = %ReqLLM.Context{messages: [message]}
+
+      {:error, error} = XAI.prepare_request(:chat, model, context, [])
+
+      assert %ReqLLM.Error.Invalid.Parameter{} = error
+      assert error.parameter =~ "text/plain"
+    end
+
+    test "allows mixed text and image content" do
+      {:ok, model} = ReqLLM.model("xai:grok-3")
+
+      text_part = ReqLLM.Message.ContentPart.text("Describe this image")
+      image_part = ReqLLM.Message.ContentPart.file(<<1, 2, 3>>, "image.png", "image/png")
+      message = %ReqLLM.Message{role: :user, content: [text_part, image_part]}
+      context = %ReqLLM.Context{messages: [message]}
+
+      {:ok, _request} = XAI.prepare_request(:chat, model, context, [])
     end
   end
 

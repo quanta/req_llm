@@ -56,6 +56,13 @@ defmodule ReqLLM.Provider.Options do
                                  doc: "Maximum number of tokens to generate"
                                ],
 
+                               # Model specific base_url
+                               base_url: [
+                                 type: :string,
+                                 doc:
+                                   "Allows base_url to be specified on a per model basis.  Commonly used for locally hosted llm servers, i.e. vLLM, etc."
+                               ],
+
                                # Advanced sampling (widely supported)
                                top_p: [
                                  type: :float,
@@ -98,7 +105,9 @@ defmodule ReqLLM.Provider.Options do
 
                                # Canonical reasoning controls
                                reasoning_effort: [
-                                 type: {:in, [:low, :medium, :high, :default]},
+                                 type:
+                                   {:in,
+                                    [:none, :minimal, :low, :medium, :high, :xhigh, :default]},
                                  doc:
                                    "Computational effort for reasoning models (higher = more thinking)"
                                ],
@@ -233,7 +242,7 @@ defmodule ReqLLM.Provider.Options do
     user_opts = normalize_legacy_options(user_opts)
 
     # Extract model options (e.g. max_tokens) if present
-    user_opts = extract_model_options(model, user_opts)
+    user_opts = maybe_extract_model_options(operation, model, user_opts)
 
     # Check for key collisions before schema validation
     check_provider_key_collisions!(provider_mod, user_opts)
@@ -244,7 +253,7 @@ defmodule ReqLLM.Provider.Options do
     # Apply pre-validation normalization (allows providers to filter/map unsupported options)
     user_opts = apply_pre_validation(provider_mod, operation, model, user_opts)
 
-    schema = compose_schema_internal(@generation_options_schema, provider_mod)
+    schema = compose_schema_internal(base_schema_for_operation(operation), provider_mod)
     validated_opts = NimbleOptions.validate!(user_opts, schema)
 
     {provider_options, standard_opts} = Keyword.pop(validated_opts, :provider_options, [])
@@ -255,7 +264,14 @@ defmodule ReqLLM.Provider.Options do
       if provider_options == [] do
         translated_opts
       else
-        Keyword.put(translated_opts, :provider_options, provider_options)
+        translated_provider_opts =
+          Keyword.take(translated_opts, Keyword.keys(provider_options))
+
+        if translated_provider_opts == [] do
+          translated_opts
+        else
+          Keyword.put(translated_opts, :provider_options, translated_provider_opts)
+        end
       end
 
     final_opts = handle_warnings(final_opts, opts)
@@ -277,6 +293,9 @@ defmodule ReqLLM.Provider.Options do
   def all_generation_keys do
     @generation_options_schema.schema |> Keyword.keys()
   end
+
+  defp base_schema_for_operation(:image), do: ReqLLM.Images.schema()
+  defp base_schema_for_operation(_operation), do: @generation_options_schema
 
   @doc """
   Extracts provider-specific options from a mixed options list.
@@ -449,6 +468,16 @@ defmodule ReqLLM.Provider.Options do
   end
 
   defp extract_model_options(%LLMDB.Model{} = model, opts) do
+    maybe_extract_max_tokens(model, opts)
+    |> maybe_extract_model_base_url(model)
+  end
+
+  defp maybe_extract_model_options(:image, _model, opts), do: opts
+
+  defp maybe_extract_model_options(_operation, model, opts),
+    do: extract_model_options(model, opts)
+
+  defp maybe_extract_max_tokens(%LLMDB.Model{} = model, opts) do
     cond do
       Keyword.has_key?(opts, :max_tokens) ->
         opts
@@ -458,6 +487,14 @@ defmodule ReqLLM.Provider.Options do
 
       true ->
         opts
+    end
+  end
+
+  defp maybe_extract_model_base_url(opts, %LLMDB.Model{} = model) do
+    if is_bitstring(model.base_url) do
+      Keyword.put(opts, :base_url, model.base_url)
+    else
+      opts
     end
   end
 
@@ -499,16 +536,32 @@ defmodule ReqLLM.Provider.Options do
         rest
         |> Keyword.put_new(:reasoning_effort, :medium)
 
+      {"auto", rest} ->
+        rest
+
+      {"none", rest} ->
+        rest
+        |> Keyword.put_new(:reasoning_effort, :none)
+
+      {"minimal", rest} ->
+        rest
+        |> Keyword.put_new(:reasoning_effort, :minimal)
+
       {"low", rest} ->
         rest
         |> Keyword.put_new(:reasoning_effort, :low)
 
-      {"auto", rest} ->
+      {"medium", rest} ->
         rest
+        |> Keyword.put_new(:reasoning_effort, :medium)
 
       {"high", rest} ->
         rest
         |> Keyword.put_new(:reasoning_effort, :high)
+
+      {"xhigh", rest} ->
+        rest
+        |> Keyword.put_new(:reasoning_effort, :xhigh)
     end
   end
 

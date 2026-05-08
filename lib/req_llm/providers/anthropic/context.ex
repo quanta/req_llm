@@ -34,6 +34,8 @@ defmodule ReqLLM.Providers.Anthropic.Context do
 
   alias ReqLLM.ToolCall
 
+  require Logger
+
   @doc """
   Encode context and model to Anthropic Messages API format.
   """
@@ -102,25 +104,46 @@ defmodule ReqLLM.Providers.Anthropic.Context do
 
   defp all_tool_results?(_), do: false
 
-  defp encode_message(%ReqLLM.Message{role: :assistant, tool_calls: tool_calls, content: content})
+  defp encode_message(%ReqLLM.Message{
+         role: :assistant,
+         tool_calls: tool_calls,
+         content: content,
+         reasoning_details: reasoning_details
+       })
        when is_list(tool_calls) and tool_calls != [] do
+    thinking_blocks = encode_reasoning_details(reasoning_details)
     text_blocks = encode_content(content)
     tool_blocks = Enum.map(tool_calls, &encode_tool_call_to_tool_use/1)
 
     %{
       role: "assistant",
-      content: combine_content_blocks(text_blocks, tool_blocks)
+      content: combine_all_content_blocks(thinking_blocks, text_blocks, tool_blocks)
     }
   end
 
-  defp encode_message(%ReqLLM.Message{role: :tool, tool_call_id: id, content: content}) do
+  defp encode_message(%ReqLLM.Message{
+         role: :assistant,
+         content: content,
+         reasoning_details: reasoning_details
+       })
+       when is_list(reasoning_details) and reasoning_details != [] do
+    thinking_blocks = encode_reasoning_details(reasoning_details)
+    text_blocks = encode_content(content)
+
+    %{
+      role: "assistant",
+      content: combine_all_content_blocks(thinking_blocks, text_blocks, [])
+    }
+  end
+
+  defp encode_message(%ReqLLM.Message{role: :tool, tool_call_id: id} = msg) do
     %{
       role: "user",
       content: [
         %{
           type: "tool_result",
           tool_use_id: id,
-          content: extract_text_content(content)
+          content: encode_tool_result_content(msg)
         }
       ]
     }
@@ -152,6 +175,11 @@ defmodule ReqLLM.Providers.Anthropic.Context do
       blocks -> blocks
     end
   end
+
+  # Must come BEFORE the empty-text guard to preserve raw_block content
+  # (e.g. server_tool_use, bash_code_execution_tool_result blocks have type: :text, text: "")
+  defp encode_content_part(%ReqLLM.Message.ContentPart{metadata: %{raw_block: block}})
+       when is_map(block), do: block
 
   defp encode_content_part(%ReqLLM.Message.ContentPart{type: :text, text: ""}), do: nil
 
@@ -186,6 +214,52 @@ defmodule ReqLLM.Providers.Anthropic.Context do
     }
   end
 
+  # File with metadata - check for file_id first (Anthropic Files API)
+  defp encode_content_part(%ReqLLM.Message.ContentPart{
+         type: :file,
+         data: data,
+         media_type: media_type,
+         filename: _filename,
+         metadata: metadata
+       })
+       when is_map(metadata) and metadata != %{} do
+    file_id = Map.get(metadata, :file_id) || Map.get(metadata, "file_id")
+
+    cond do
+      # Has file_id - reference uploaded file, choosing block type based on media_type
+      file_id != nil ->
+        cond do
+          document_media_type?(media_type) ->
+            %{type: "document", source: %{type: "file", file_id: file_id}}
+
+          image_media_type?(media_type) ->
+            %{type: "image", source: %{type: "file", file_id: file_id}}
+
+          true ->
+            # Excel, PowerPoint, Word, CSV, etc. → container_upload
+            %{type: "container_upload", file_id: file_id}
+        end
+
+      # Has data - encode as base64 (inline file)
+      data != nil ->
+        if image_media_type?(media_type) do
+          %{
+            type: "image",
+            source: %{type: "base64", media_type: media_type, data: Base.encode64(data)}
+          }
+        else
+          %{
+            type: "document",
+            source: %{type: "base64", media_type: media_type, data: Base.encode64(data)}
+          }
+        end
+
+      # No file_id and no data - skip this content part
+      true ->
+        nil
+    end
+  end
+
   defp encode_content_part(%ReqLLM.Message.ContentPart{
          type: :file,
          data: data,
@@ -194,17 +268,24 @@ defmodule ReqLLM.Providers.Anthropic.Context do
        }) do
     base64 = Base.encode64(data)
 
-    %{
-      type: "document",
-      source: %{
-        type: "base64",
-        media_type: media_type,
-        data: base64
-      }
-    }
+    if image_media_type?(media_type) do
+      %{type: "image", source: %{type: "base64", media_type: media_type, data: base64}}
+    else
+      %{type: "document", source: %{type: "base64", media_type: media_type, data: base64}}
+    end
+  end
+
+  defp encode_content_part(%ReqLLM.Message.ContentPart{type: :compaction, text: text}) do
+    %{type: "compaction", content: text}
   end
 
   defp encode_content_part(_), do: nil
+
+  defp document_media_type?(mt) when is_binary(mt), do: mt in ["application/pdf", "text/plain"]
+  defp document_media_type?(_), do: false
+
+  defp image_media_type?(mt) when is_binary(mt), do: String.starts_with?(mt, "image/")
+  defp image_media_type?(_), do: false
 
   defp encode_tool_call_to_tool_use(%ToolCall{id: id, function: %{name: name, arguments: args}}) do
     %{type: "tool_use", id: id, name: name, input: decode_tool_arguments(args)}
@@ -222,27 +303,60 @@ defmodule ReqLLM.Providers.Anthropic.Context do
   defp decode_tool_arguments(args) when is_map(args), do: args
   defp decode_tool_arguments(nil), do: %{}
 
-  defp combine_content_blocks(text_blocks, tool_blocks) when is_list(text_blocks) do
-    text_blocks ++ tool_blocks
+  defp combine_all_content_blocks(thinking_blocks, text_blocks, tool_blocks)
+       when is_list(text_blocks) do
+    thinking_blocks ++ text_blocks ++ tool_blocks
   end
 
-  defp combine_content_blocks("", tool_blocks), do: tool_blocks
-
-  defp combine_content_blocks(text_string, tool_blocks) when is_binary(text_string) do
-    [%{type: "text", text: text_string}] ++ tool_blocks
+  defp combine_all_content_blocks(thinking_blocks, "", tool_blocks) do
+    thinking_blocks ++ tool_blocks
   end
 
-  defp extract_text_content(content_parts) when is_list(content_parts) do
-    content_parts
-    |> Enum.find_value(fn
-      %ReqLLM.Message.ContentPart{type: :text, text: text} -> text
-      _ -> nil
-    end)
-    |> case do
-      nil -> ""
-      text -> text
+  defp combine_all_content_blocks(thinking_blocks, text_string, tool_blocks)
+       when is_binary(text_string) do
+    thinking_blocks ++ [%{type: "text", text: text_string}] ++ tool_blocks
+  end
+
+  defp encode_reasoning_details(nil), do: []
+  defp encode_reasoning_details([]), do: []
+
+  defp encode_reasoning_details(details) when is_list(details) do
+    details
+    |> Enum.sort_by(& &1.index)
+    |> Enum.flat_map(&encode_single_reasoning_detail/1)
+  end
+
+  defp encode_single_reasoning_detail(
+         %ReqLLM.Message.ReasoningDetails{provider: :anthropic} = detail
+       ) do
+    block = %{type: "thinking", thinking: detail.text || ""}
+    block = if detail.signature, do: Map.put(block, :signature, detail.signature), else: block
+    [block]
+  end
+
+  defp encode_single_reasoning_detail(%ReqLLM.Message.ReasoningDetails{provider: provider}) do
+    Logger.debug("Skipping non-Anthropic reasoning detail from provider: #{inspect(provider)}")
+    []
+  end
+
+  defp encode_single_reasoning_detail(_), do: []
+
+  defp encode_tool_result_content(%ReqLLM.Message{content: content} = msg) do
+    output = ReqLLM.ToolResult.output_from_message(msg)
+
+    cond do
+      content != [] -> encode_content(content)
+      output != nil -> encode_tool_output(output)
+      true -> ""
     end
   end
+
+  defp encode_tool_output(output) when is_binary(output), do: output
+
+  defp encode_tool_output(output) when is_map(output) or is_list(output),
+    do: Jason.encode!(output)
+
+  defp encode_tool_output(output), do: to_string(output)
 
   defp add_tools(request, []), do: request
 

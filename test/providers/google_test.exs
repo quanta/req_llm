@@ -201,6 +201,54 @@ defmodule ReqLLM.Providers.GoogleTest do
       assert is_list(tool_def["functionDeclarations"])
     end
 
+    test "encode_body includes tool_result name and structured response" do
+      {:ok, model} = ReqLLM.model("google:gemini-1.5-flash")
+
+      tool_result =
+        Context.tool_result_message(
+          "get_weather",
+          "call_1",
+          %ReqLLM.ToolResult{output: %{"temperature" => 72}}
+        )
+
+      context =
+        Context.new([
+          Context.user("What's the weather?"),
+          Context.assistant("",
+            tool_calls: [
+              %ReqLLM.ToolCall{
+                id: "call_1",
+                type: "function",
+                function: %{name: "get_weather", arguments: ~s({"location":"SF"})}
+              }
+            ]
+          ),
+          tool_result
+        ])
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          stream: false,
+          operation: :chat
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      tool_parts =
+        decoded["contents"]
+        |> Enum.flat_map(& &1["parts"])
+        |> Enum.filter(&Map.has_key?(&1, "functionResponse"))
+
+      [tool_part] = tool_parts
+      function_response = tool_part["functionResponse"]
+      assert function_response["name"] == "get_weather"
+      assert function_response["response"]["temperature"] == 72
+    end
+
     test "encode_body with Google-specific options" do
       {:ok, model} = ReqLLM.model("google:gemini-1.5-flash")
       context = context_fixture()
@@ -254,6 +302,115 @@ defmodule ReqLLM.Providers.GoogleTest do
       assert decoded["model"] == "models/gemini-embedding-001"
       assert decoded["content"]["parts"] == [%{"text" => "Hello, world!"}]
       assert decoded["outputDimensionality"] == 768
+    end
+  end
+
+  describe "google_url_context option" do
+    test "encode_body includes url_context tool when boolean true" do
+      {:ok, model} = ReqLLM.model("google:gemini-2.0-flash")
+      context = context_fixture()
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          stream: false,
+          google_url_context: true
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      assert is_list(decoded["tools"])
+      assert length(decoded["tools"]) == 1
+      [tool] = decoded["tools"]
+      assert Map.has_key?(tool, "url_context")
+      assert tool["url_context"] == %{}
+    end
+
+    test "encode_body includes url_context tool with map options" do
+      {:ok, model} = ReqLLM.model("google:gemini-2.0-flash")
+      context = context_fixture()
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          stream: false,
+          google_url_context: %{some_option: "value"}
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      assert is_list(decoded["tools"])
+      assert length(decoded["tools"]) == 1
+      [tool] = decoded["tools"]
+      assert Map.has_key?(tool, "url_context")
+      assert tool["url_context"] == %{"some_option" => "value"}
+    end
+
+    test "encode_body combines url_context with user tools" do
+      {:ok, model} = ReqLLM.model("google:gemini-2.0-flash")
+      context = context_fixture()
+
+      tool =
+        ReqLLM.Tool.new!(
+          name: "test_tool",
+          description: "A test tool",
+          parameter_schema: [
+            name: [type: :string, required: true, doc: "A name parameter"]
+          ],
+          callback: fn _ -> {:ok, "result"} end
+        )
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          stream: false,
+          tools: [tool],
+          google_url_context: true,
+          operation: :chat
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      assert is_list(decoded["tools"])
+      assert length(decoded["tools"]) == 2
+
+      tool_types = Enum.map(decoded["tools"], fn t -> Map.keys(t) end) |> List.flatten()
+      assert "url_context" in tool_types
+      assert "functionDeclarations" in tool_types
+    end
+
+    test "encode_body combines url_context with grounding" do
+      {:ok, model} = ReqLLM.model("google:gemini-2.0-flash")
+      context = context_fixture()
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          stream: false,
+          google_grounding: %{enable: true},
+          google_url_context: true
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      assert is_list(decoded["tools"])
+      assert length(decoded["tools"]) == 2
+
+      tool_types = Enum.map(decoded["tools"], fn t -> Map.keys(t) end) |> List.flatten()
+      assert "url_context" in tool_types
+      assert "google_search" in tool_types
     end
   end
 
@@ -548,6 +705,29 @@ defmodule ReqLLM.Providers.GoogleTest do
                "Expected #{provider_option} to be in supported options"
       end
     end
+
+    test "translate_options maps reasoning_effort to google_thinking_budget" do
+      {:ok, model} = ReqLLM.model("google:gemini-1.5-flash")
+
+      test_cases = [
+        {:none, 0},
+        {:minimal, 2_048},
+        {:low, 4_096},
+        {:medium, 8_192},
+        {:high, 16_384},
+        {:xhigh, 32_768}
+      ]
+
+      for {effort, expected_budget} <- test_cases do
+        opts = [reasoning_effort: effort]
+        {translated_opts, _warnings} = Google.translate_options(:chat, model, opts)
+
+        provider_opts = Keyword.get(translated_opts, :provider_options, [])
+
+        assert Keyword.get(provider_opts, :google_thinking_budget) == expected_budget,
+               "Expected reasoning_effort #{inspect(effort)} to map to budget #{expected_budget}"
+      end
+    end
   end
 
   describe "usage extraction" do
@@ -618,6 +798,129 @@ defmodule ReqLLM.Providers.GoogleTest do
       assert usage.output_tokens == 20
       assert usage.total_tokens == 30
       assert usage.cached_tokens == 0
+    end
+
+    test "extract_usage includes image usage when inline data is present" do
+      model = %LLMDB.Model{provider: :google, id: "gemini-2.5-flash-image"}
+
+      body_with_image = %{
+        "candidates" => [
+          %{
+            "content" => %{
+              "parts" => [
+                %{
+                  "inlineData" => %{
+                    "mimeType" => "image/png",
+                    "data" => "AAA"
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+
+      {:ok, usage} = Google.extract_usage(body_with_image, model)
+      assert usage.image_usage.generated.count == 1
+    end
+
+    test "extract_usage counts web searches when pricing unit is query" do
+      model = %LLMDB.Model{
+        id: "gemini-query-billed",
+        provider: :google,
+        pricing: %{
+          components: [
+            %{
+              id: "tool.web_search",
+              kind: "tool",
+              tool: "web_search",
+              unit: "query",
+              per: 1000,
+              rate: 14.0
+            }
+          ]
+        }
+      }
+
+      body = %{
+        "usageMetadata" => %{
+          "promptTokenCount" => 10,
+          "candidatesTokenCount" => 20,
+          "totalTokenCount" => 30
+        },
+        "candidates" => [
+          %{
+            "groundingMetadata" => %{
+              "webSearchQueries" => ["q1", "q2"]
+            }
+          }
+        ]
+      }
+
+      {:ok, usage} = Google.extract_usage(body, model)
+      assert usage[:tool_usage][:web_search][:count] == 2
+      assert usage[:tool_usage][:web_search][:unit] == "query"
+    end
+
+    test "extract_usage defaults web search count to 1 when pricing unit is not query" do
+      model = %LLMDB.Model{
+        id: "gemini-2.5-flash",
+        provider: :google,
+        pricing: %{
+          components: [
+            %{
+              id: "tool.web_search",
+              kind: "tool",
+              tool: "web_search",
+              unit: "call",
+              per: 1000,
+              rate: 35.0
+            }
+          ]
+        }
+      }
+
+      body = %{
+        "usageMetadata" => %{
+          "promptTokenCount" => 10,
+          "candidatesTokenCount" => 20,
+          "totalTokenCount" => 30
+        },
+        "candidates" => [
+          %{
+            "groundingMetadata" => %{
+              "webSearchQueries" => ["q1", "q2"]
+            }
+          }
+        ]
+      }
+
+      {:ok, usage} = Google.extract_usage(body, model)
+      assert usage[:tool_usage][:web_search][:count] == 1
+      assert usage[:tool_usage][:web_search][:unit] == "call"
+    end
+
+    test "extract_usage handles missing web search pricing component" do
+      model = %LLMDB.Model{id: "gemini-no-pricing", provider: :google, pricing: nil}
+
+      body = %{
+        "usageMetadata" => %{
+          "promptTokenCount" => 10,
+          "candidatesTokenCount" => 20,
+          "totalTokenCount" => 30
+        },
+        "candidates" => [
+          %{
+            "groundingMetadata" => %{
+              "webSearchQueries" => ["q1", "q2"]
+            }
+          }
+        ]
+      }
+
+      {:ok, usage} = Google.extract_usage(body, model)
+      assert usage[:tool_usage][:web_search][:count] == 1
+      assert usage[:tool_usage][:web_search][:unit] == :call
     end
   end
 
@@ -918,6 +1221,540 @@ defmodule ReqLLM.Providers.GoogleTest do
       assert Map.has_key?(part, "inline_data")
       assert part["inline_data"]["mime_type"] == "image/png"
       assert Base.decode64!(part["inline_data"]["data"]) == image_content
+    end
+  end
+
+  describe "image_url file URI support" do
+    test "encode_body converts HTTPS image_url to fileData format" do
+      url = "https://example.com/images/photo.jpg"
+
+      image_url_part = ReqLLM.Message.ContentPart.image_url(url)
+
+      message = %ReqLLM.Message{
+        role: :user,
+        content: [image_url_part]
+      }
+
+      context = %ReqLLM.Context{messages: [message]}
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          id: "gemini-1.5-flash",
+          stream: false
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      [user_msg] = decoded["contents"]
+      [part] = user_msg["parts"]
+
+      assert Map.has_key?(part, "fileData")
+      assert part["fileData"]["fileUri"] == url
+      assert part["fileData"]["mimeType"] == "image/jpeg"
+    end
+
+    test "encode_body converts HTTP image_url to fileData format" do
+      url = "http://example.com/images/photo.png"
+
+      image_url_part = ReqLLM.Message.ContentPart.image_url(url)
+
+      message = %ReqLLM.Message{
+        role: :user,
+        content: [image_url_part]
+      }
+
+      context = %ReqLLM.Context{messages: [message]}
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          id: "gemini-1.5-flash",
+          stream: false
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      [user_msg] = decoded["contents"]
+      [part] = user_msg["parts"]
+
+      assert Map.has_key?(part, "fileData")
+      assert part["fileData"]["fileUri"] == url
+      assert part["fileData"]["mimeType"] == "image/png"
+    end
+
+    test "encode_body converts GCS URI to fileData format" do
+      url = "gs://my-bucket/path/to/document.pdf"
+
+      image_url_part = ReqLLM.Message.ContentPart.image_url(url)
+
+      message = %ReqLLM.Message{
+        role: :user,
+        content: [image_url_part]
+      }
+
+      context = %ReqLLM.Context{messages: [message]}
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          id: "gemini-1.5-flash",
+          stream: false
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      [user_msg] = decoded["contents"]
+      [part] = user_msg["parts"]
+
+      assert Map.has_key?(part, "fileData")
+      assert part["fileData"]["fileUri"] == url
+      assert part["fileData"]["mimeType"] == "application/pdf"
+    end
+
+    test "encode_body infers mime type from URL extension" do
+      test_cases = [
+        {"https://example.com/file.jpg", "image/jpeg"},
+        {"https://example.com/file.jpeg", "image/jpeg"},
+        {"https://example.com/file.png", "image/png"},
+        {"https://example.com/file.gif", "image/gif"},
+        {"https://example.com/file.webp", "image/webp"},
+        {"https://example.com/file.pdf", "application/pdf"},
+        {"https://example.com/file.mp3", "audio/mpeg"},
+        {"https://example.com/file.mp4", "video/mp4"},
+        {"https://example.com/file.m4a", "audio/mp4"},
+        {"https://example.com/file.wav", "audio/wav"},
+        {"https://example.com/file.unknown", "application/octet-stream"}
+      ]
+
+      for {url, expected_mime} <- test_cases do
+        image_url_part = ReqLLM.Message.ContentPart.image_url(url)
+
+        message = %ReqLLM.Message{
+          role: :user,
+          content: [image_url_part]
+        }
+
+        context = %ReqLLM.Context{messages: [message]}
+
+        mock_request = %Req.Request{
+          options: [
+            context: context,
+            id: "gemini-1.5-flash",
+            stream: false
+          ]
+        }
+
+        updated_request = Google.encode_body(mock_request)
+        decoded = Jason.decode!(updated_request.body)
+
+        [user_msg] = decoded["contents"]
+        [part] = user_msg["parts"]
+
+        assert part["fileData"]["mimeType"] == expected_mime,
+               "Expected #{expected_mime} for #{url}, got #{part["fileData"]["mimeType"]}"
+      end
+    end
+
+    test "encode_body strips query params when inferring mime type from URL" do
+      url = "https://example.com/image.jpg?token=abc123&size=large"
+
+      image_url_part = ReqLLM.Message.ContentPart.image_url(url)
+
+      message = %ReqLLM.Message{
+        role: :user,
+        content: [image_url_part]
+      }
+
+      context = %ReqLLM.Context{messages: [message]}
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          id: "gemini-1.5-flash",
+          stream: false
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      [user_msg] = decoded["contents"]
+      [part] = user_msg["parts"]
+
+      assert part["fileData"]["mimeType"] == "image/jpeg"
+      # URL should be preserved with query params
+      assert part["fileData"]["fileUri"] == url
+    end
+
+    test "encode_body handles data URI format in image_url" do
+      base64_data = Base.encode64("fake image data")
+      url = "data:image/png;base64,#{base64_data}"
+
+      image_url_part = ReqLLM.Message.ContentPart.image_url(url)
+
+      message = %ReqLLM.Message{
+        role: :user,
+        content: [image_url_part]
+      }
+
+      context = %ReqLLM.Context{messages: [message]}
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          id: "gemini-1.5-flash",
+          stream: false
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      [user_msg] = decoded["contents"]
+      [part] = user_msg["parts"]
+
+      # Data URIs should use inline_data format, not fileData
+      assert Map.has_key?(part, "inline_data")
+      assert part["inline_data"]["mime_type"] == "image/png"
+      assert part["inline_data"]["data"] == base64_data
+    end
+
+    test "encode_body returns error text for unsupported URL schemes" do
+      url = "ftp://example.com/file.jpg"
+
+      image_url_part = ReqLLM.Message.ContentPart.image_url(url)
+
+      message = %ReqLLM.Message{
+        role: :user,
+        content: [image_url_part]
+      }
+
+      context = %ReqLLM.Context{messages: [message]}
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          id: "gemini-1.5-flash",
+          stream: false
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      [user_msg] = decoded["contents"]
+      [part] = user_msg["parts"]
+
+      # Should fall back to text with error message
+      assert Map.has_key?(part, "text")
+      assert part["text"] =~ "Unsupported URL scheme"
+    end
+
+    test "encode_body handles malformed data URI gracefully" do
+      # Data URI without the comma separator
+      url = "data:image/png;base64"
+
+      image_url_part = ReqLLM.Message.ContentPart.image_url(url)
+
+      message = %ReqLLM.Message{
+        role: :user,
+        content: [image_url_part]
+      }
+
+      context = %ReqLLM.Context{messages: [message]}
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          id: "gemini-1.5-flash",
+          stream: false
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      [user_msg] = decoded["contents"]
+      [part] = user_msg["parts"]
+
+      assert Map.has_key?(part, "text")
+      assert part["text"] =~ "Malformed data URI"
+    end
+  end
+
+  describe "thought signature support" do
+    test "decode_response extracts reasoning_details from thought parts" do
+      google_response = %{
+        "candidates" => [
+          %{
+            "content" => %{
+              "parts" => [
+                %{
+                  "text" => "Let me think about this...",
+                  "thought" => true,
+                  "thoughtSignature" => "base64signature123"
+                },
+                %{"text" => "The answer is 42."}
+              ],
+              "role" => "model"
+            },
+            "finishReason" => "STOP"
+          }
+        ],
+        "usageMetadata" => %{
+          "promptTokenCount" => 10,
+          "candidatesTokenCount" => 15,
+          "totalTokenCount" => 25,
+          "thoughtsTokenCount" => 5
+        }
+      }
+
+      mock_resp = %Req.Response{
+        status: 200,
+        body: google_response
+      }
+
+      {:ok, model} = ReqLLM.model("google:gemini-2.5-flash")
+      context = context_fixture()
+
+      mock_req = %Req.Request{
+        options: [context: context, stream: false, model: model.model]
+      }
+
+      {_req, resp} = Google.decode_response({mock_req, mock_resp})
+
+      assert %ReqLLM.Response{} = resp.body
+      response = resp.body
+
+      assert response.message.reasoning_details != nil
+      assert length(response.message.reasoning_details) == 1
+
+      [detail] = response.message.reasoning_details
+      assert %ReqLLM.Message.ReasoningDetails{} = detail
+      assert detail.text == "Let me think about this..."
+      assert detail.signature == "base64signature123"
+      assert detail.encrypted? == true
+      assert detail.provider == :google
+      assert detail.format == "google-gemini-v1"
+      assert detail.index == 0
+      assert detail.provider_data == %{"thought" => true}
+    end
+
+    test "decode_response returns nil reasoning_details when no thought parts" do
+      google_response = %{
+        "candidates" => [
+          %{
+            "content" => %{
+              "parts" => [%{"text" => "The answer is 42."}],
+              "role" => "model"
+            },
+            "finishReason" => "STOP"
+          }
+        ],
+        "usageMetadata" => %{
+          "promptTokenCount" => 10,
+          "candidatesTokenCount" => 15,
+          "totalTokenCount" => 25
+        }
+      }
+
+      mock_resp = %Req.Response{
+        status: 200,
+        body: google_response
+      }
+
+      {:ok, model} = ReqLLM.model("google:gemini-2.5-flash")
+      context = context_fixture()
+
+      mock_req = %Req.Request{
+        options: [context: context, stream: false, model: model.model]
+      }
+
+      {_req, resp} = Google.decode_response({mock_req, mock_resp})
+
+      assert %ReqLLM.Response{} = resp.body
+      assert resp.body.message.reasoning_details == nil
+    end
+
+    test "encode_body includes thought parts from assistant message reasoning_details" do
+      {:ok, model} = ReqLLM.model("google:gemini-2.5-flash")
+
+      reasoning_detail = %ReqLLM.Message.ReasoningDetails{
+        text: "Let me think step by step...",
+        signature: "signatureABC123",
+        encrypted?: true,
+        provider: :google,
+        format: "google-gemini-v1",
+        index: 0,
+        provider_data: %{"thought" => true}
+      }
+
+      assistant_message = %ReqLLM.Message{
+        role: :assistant,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "The answer is 42."}],
+        reasoning_details: [reasoning_detail]
+      }
+
+      user_message = %ReqLLM.Message{
+        role: :user,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "What is the answer?"}]
+      }
+
+      context = %ReqLLM.Context{messages: [user_message, assistant_message]}
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          stream: false
+        ]
+      }
+
+      updated_request = Google.encode_body(mock_request)
+      decoded = Jason.decode!(updated_request.body)
+
+      assert is_list(decoded["contents"])
+      assert length(decoded["contents"]) == 2
+
+      [_user_msg, model_msg] = decoded["contents"]
+      assert model_msg["role"] == "model"
+
+      parts = model_msg["parts"]
+      assert length(parts) == 2
+
+      [thought_part, text_part] = parts
+      assert thought_part["thought"] == true
+      assert thought_part["text"] == "Let me think step by step..."
+      assert thought_part["thoughtSignature"] == "signatureABC123"
+
+      assert text_part["text"] == "The answer is 42."
+      refute Map.has_key?(text_part, "thought")
+    end
+
+    test "encode_body skips non-Google reasoning_details with warning" do
+      import ExUnit.CaptureLog
+
+      {:ok, model} = ReqLLM.model("google:gemini-2.5-flash")
+
+      anthropic_detail = %ReqLLM.Message.ReasoningDetails{
+        text: "Anthropic thinking...",
+        signature: "anthropic-sig",
+        encrypted?: false,
+        provider: :anthropic,
+        format: "anthropic-thinking-v1",
+        index: 0,
+        provider_data: %{"type" => "thinking"}
+      }
+
+      assistant_message = %ReqLLM.Message{
+        role: :assistant,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "Response"}],
+        reasoning_details: [anthropic_detail]
+      }
+
+      context = %ReqLLM.Context{messages: [assistant_message]}
+
+      mock_request = %Req.Request{
+        options: [
+          context: context,
+          model: model.model,
+          stream: false
+        ]
+      }
+
+      log =
+        capture_log(fn ->
+          updated_request = Google.encode_body(mock_request)
+          decoded = Jason.decode!(updated_request.body)
+
+          [model_msg] = decoded["contents"]
+          parts = model_msg["parts"]
+
+          assert length(parts) == 1
+          [text_part] = parts
+          assert text_part["text"] == "Response"
+          refute Map.has_key?(text_part, "thought")
+        end)
+
+      assert log =~ "Skipping non-Google reasoning detail"
+    end
+  end
+
+  describe "google_auth_header option for streaming" do
+    setup do
+      {:ok, model} = ReqLLM.model("google:gemini-2.0-flash-exp")
+      context = Context.new([Context.user("test")])
+      {:ok, model: model, context: context}
+    end
+
+    test "default streaming uses query param auth", %{model: model, context: context} do
+      opts = [api_key: "test-api-key"]
+
+      {:ok, finch_request} = Google.attach_stream(model, context, opts, nil)
+
+      assert finch_request.query =~ "key=test-api-key"
+      assert finch_request.query =~ "alt=sse"
+      refute has_header?(finch_request.headers, "x-goog-api-key")
+    end
+
+    test "google_auth_header: true uses header auth instead of query param", %{
+      model: model,
+      context: context
+    } do
+      opts = [
+        api_key: "test-api-key",
+        provider_options: [google_auth_header: true]
+      ]
+
+      {:ok, finch_request} = Google.attach_stream(model, context, opts, nil)
+
+      refute finch_request.query =~ "key="
+      assert finch_request.query == "alt=sse"
+      assert has_header_value?(finch_request.headers, "x-goog-api-key", "test-api-key")
+    end
+
+    test "google_auth_header: false behaves same as default", %{model: model, context: context} do
+      opts = [
+        api_key: "test-api-key",
+        provider_options: [google_auth_header: false]
+      ]
+
+      {:ok, finch_request} = Google.attach_stream(model, context, opts, nil)
+
+      assert finch_request.query =~ "key=test-api-key"
+      refute has_header?(finch_request.headers, "x-goog-api-key")
+    end
+
+    test "google_auth_header works with custom base_url for proxies", %{
+      model: model,
+      context: context
+    } do
+      opts = [
+        api_key: "proxy-api-key",
+        base_url: "https://openai-proxy.example.com/v1",
+        provider_options: [google_auth_header: true]
+      ]
+
+      {:ok, finch_request} = Google.attach_stream(model, context, opts, nil)
+
+      assert finch_request.host == "openai-proxy.example.com"
+      refute finch_request.query =~ "key="
+      assert has_header_value?(finch_request.headers, "x-goog-api-key", "proxy-api-key")
+    end
+
+    defp has_header?(headers, name) do
+      Enum.any?(headers, fn {n, _v} -> n == name end)
+    end
+
+    defp has_header_value?(headers, name, value) do
+      Enum.any?(headers, fn {n, v} -> n == name and v == value end)
     end
   end
 end

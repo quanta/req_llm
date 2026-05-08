@@ -122,6 +122,41 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert body["tool_choice"] == "required"
     end
 
+    test "encodes structured tool outputs from context metadata" do
+      tool_call = %ReqLLM.ToolCall{
+        id: "call_1",
+        type: "function",
+        function: %{name: "get_weather", arguments: ~s({"location":"SF"})}
+      }
+
+      assistant_msg = %ReqLLM.Message{
+        role: :assistant,
+        content: [],
+        tool_calls: [tool_call]
+      }
+
+      tool_result =
+        ReqLLM.Context.tool_result_message(
+          "get_weather",
+          "call_1",
+          %ReqLLM.ToolResult{output: %{temp: 72}}
+        )
+
+      context = %ReqLLM.Context{messages: [assistant_msg, tool_result]}
+      request = build_request(context: context)
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      tool_output =
+        Enum.find(body["input"], fn item ->
+          item["type"] == "function_call_output"
+        end)
+
+      assert tool_output["call_id"] == "call_1"
+      assert Jason.decode!(tool_output["output"]) == %{"temp" => 72}
+    end
+
     test "encodes specific tool choice with atom keys" do
       request =
         build_request(tool_choice: %{type: "function", function: %{name: "get_weather"}})
@@ -158,6 +193,33 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       body = Jason.decode!(encoded.body)
 
       assert body["reasoning"] == %{"effort" => "high"}
+    end
+
+    test "encodes reasoning effort :none" do
+      request = build_request(reasoning_effort: :none)
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      assert body["reasoning"] == %{"effort" => "none"}
+    end
+
+    test "encodes reasoning effort :minimal" do
+      request = build_request(reasoning_effort: :minimal)
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      assert body["reasoning"] == %{"effort" => "minimal"}
+    end
+
+    test "encodes reasoning effort :xhigh" do
+      request = build_request(reasoning_effort: :xhigh)
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      assert body["reasoning"] == %{"effort" => "xhigh"}
     end
 
     test "omits reasoning effort when nil" do
@@ -280,6 +342,60 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert body["text"]["format"]["name"] == "search_schema"
       assert body["text"]["format"]["strict"] == true
       assert body["text"]["format"]["schema"] == json_schema
+    end
+
+    test "encodes verbosity when provided as atom" do
+      request = build_request(provider_options: [verbosity: :low])
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      assert body["text"]["verbosity"] == "low"
+    end
+
+    test "encodes verbosity when provided as string" do
+      request = build_request(provider_options: [verbosity: "high"])
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      assert body["text"]["verbosity"] == "high"
+    end
+
+    test "omits text field when no verbosity or response_format" do
+      request = build_request(provider_options: [])
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      refute Map.has_key?(body, "text")
+    end
+
+    test "encodes verbosity alongside response_format in text object" do
+      json_schema = %{
+        "type" => "object",
+        "properties" => %{"name" => %{"type" => "string"}},
+        "required" => ["name"]
+      }
+
+      response_format = %{
+        type: "json_schema",
+        json_schema: %{
+          name: "test_schema",
+          strict: true,
+          schema: json_schema
+        }
+      }
+
+      request =
+        build_request(provider_options: [response_format: response_format, verbosity: :medium])
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      assert body["text"]["format"]["type"] == "json_schema"
+      assert body["text"]["format"]["name"] == "test_schema"
+      assert body["text"]["verbosity"] == "medium"
     end
   end
 
@@ -644,6 +760,29 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert chunk.metadata.finish_reason == :length
     end
 
+    test "decodes incomplete event with usage so metadata includes usage when finish_reason is length",
+         %{model: model} do
+      event = %{
+        data: %{
+          "event" => "response.incomplete",
+          "reason" => "length",
+          "response" => %{
+            "incomplete_details" => %{"reason" => "length"},
+            "usage" => %{
+              "input_tokens" => 8,
+              "output_tokens" => 12
+            }
+          }
+        }
+      }
+
+      assert [chunk] = ResponsesAPI.decode_stream_event(event, model)
+      assert chunk.type == :meta
+      assert chunk.metadata.terminal? == true
+      assert chunk.metadata.finish_reason == :length
+      assert %{input_tokens: 8, output_tokens: 12, total_tokens: 20} = chunk.metadata.usage
+    end
+
     test "handles [DONE] event", %{model: model} do
       event = %{data: "[DONE]"}
 
@@ -670,6 +809,276 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       event = %{data: %{"delta" => "text"}}
 
       assert [] = ResponsesAPI.decode_stream_event(event, model)
+    end
+  end
+
+  describe "reasoning details - decode_response/1" do
+    test "decodes reasoning items with summary_text array and populates reasoning_details" do
+      response_body = %{
+        "id" => "resp_123",
+        "model" => "gpt-5",
+        "output" => [
+          %{
+            "id" => "rs_abc123",
+            "type" => "reasoning",
+            "summary" => [
+              %{"type" => "summary_text", "text" => "Analyzing the problem..."},
+              %{"type" => "summary_text", "text" => " Breaking it down..."}
+            ],
+            "encrypted_content" => "base64_encrypted_content_here"
+          },
+          %{
+            "type" => "message",
+            "content" => [%{"type" => "output_text", "text" => "The answer is 42."}]
+          }
+        ],
+        "usage" => %{"input_tokens" => 10, "output_tokens" => 50}
+      }
+
+      {_req, resp} = ResponsesAPI.decode_response(build_response(200, response_body))
+
+      assert %ReqLLM.Response{} = resp.body
+      assert [reasoning_detail] = resp.body.message.reasoning_details
+      assert %ReqLLM.Message.ReasoningDetails{} = reasoning_detail
+      assert reasoning_detail.text == "Analyzing the problem... Breaking it down..."
+      assert reasoning_detail.signature == "base64_encrypted_content_here"
+      assert reasoning_detail.encrypted? == true
+      assert reasoning_detail.provider == :openai
+      assert reasoning_detail.format == "openai-responses-v1"
+      assert reasoning_detail.index == 0
+      assert reasoning_detail.provider_data == %{"id" => "rs_abc123", "type" => "reasoning"}
+    end
+
+    test "decodes reasoning items with string summary" do
+      response_body = %{
+        "id" => "resp_123",
+        "model" => "gpt-5",
+        "output" => [
+          %{
+            "id" => "rs_xyz789",
+            "type" => "reasoning",
+            "summary" => "Thinking step by step..."
+          }
+        ],
+        "usage" => %{"input_tokens" => 5, "output_tokens" => 10}
+      }
+
+      {_req, resp} = ResponsesAPI.decode_response(build_response(200, response_body))
+
+      assert [reasoning_detail] = resp.body.message.reasoning_details
+      assert reasoning_detail.text == "Thinking step by step..."
+      assert reasoning_detail.encrypted? == false
+      assert reasoning_detail.signature == nil
+    end
+
+    test "decodes multiple reasoning items preserving order" do
+      response_body = %{
+        "id" => "resp_123",
+        "model" => "gpt-5",
+        "output" => [
+          %{
+            "id" => "rs_001",
+            "type" => "reasoning",
+            "summary" => [%{"type" => "summary_text", "text" => "First thought"}]
+          },
+          %{
+            "id" => "rs_002",
+            "type" => "reasoning",
+            "summary" => [%{"type" => "summary_text", "text" => "Second thought"}]
+          }
+        ],
+        "usage" => %{"input_tokens" => 5, "output_tokens" => 10}
+      }
+
+      {_req, resp} = ResponsesAPI.decode_response(build_response(200, response_body))
+
+      assert [first, second] = resp.body.message.reasoning_details
+      assert first.text == "First thought"
+      assert first.index == 0
+      assert second.text == "Second thought"
+      assert second.index == 1
+    end
+
+    test "response without reasoning items has nil reasoning_details" do
+      response_body = %{
+        "id" => "resp_123",
+        "model" => "gpt-5",
+        "output_text" => "Just a simple response",
+        "usage" => %{"input_tokens" => 5, "output_tokens" => 10}
+      }
+
+      {_req, resp} = ResponsesAPI.decode_response(build_response(200, response_body))
+
+      assert resp.body.message.reasoning_details == nil
+    end
+
+    test "response with empty reasoning has nil text but retains encrypted_content" do
+      response_body = %{
+        "id" => "resp_123",
+        "model" => "gpt-5",
+        "output" => [
+          %{
+            "id" => "rs_abc",
+            "type" => "reasoning",
+            "summary" => [],
+            "encrypted_content" => "encrypted_data"
+          }
+        ],
+        "usage" => %{"input_tokens" => 5, "output_tokens" => 10}
+      }
+
+      {_req, resp} = ResponsesAPI.decode_response(build_response(200, response_body))
+
+      assert [detail] = resp.body.message.reasoning_details
+      assert detail.text == nil
+      assert detail.signature == "encrypted_data"
+      assert detail.encrypted? == true
+    end
+  end
+
+  describe "reasoning details - encode_body/1" do
+    test "includes reasoning items in input when no previous_response_id" do
+      reasoning_detail = %ReqLLM.Message.ReasoningDetails{
+        text: "Previous reasoning",
+        signature: "encrypted_sig_abc",
+        encrypted?: true,
+        provider: :openai,
+        format: "openai-responses-v1",
+        index: 0,
+        provider_data: %{"id" => "rs_prev123", "type" => "reasoning"}
+      }
+
+      assistant_msg = %ReqLLM.Message{
+        role: :assistant,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "Previous answer"}],
+        reasoning_details: [reasoning_detail]
+      }
+
+      user_msg = %ReqLLM.Message{
+        role: :user,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "Follow up question"}]
+      }
+
+      context = %ReqLLM.Context{messages: [assistant_msg, user_msg]}
+      request = build_request(context: context)
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      assert [reasoning_input | _rest] = body["input"]
+      assert reasoning_input["type"] == "reasoning"
+      assert reasoning_input["id"] == "rs_prev123"
+      assert reasoning_input["encrypted_content"] == "encrypted_sig_abc"
+    end
+
+    test "does not include reasoning items when previous_response_id is present" do
+      reasoning_detail = %ReqLLM.Message.ReasoningDetails{
+        text: "Previous reasoning",
+        signature: "encrypted_sig",
+        encrypted?: true,
+        provider: :openai,
+        format: "openai-responses-v1",
+        index: 0,
+        provider_data: %{"id" => "rs_123", "type" => "reasoning"}
+      }
+
+      assistant_msg = %ReqLLM.Message{
+        role: :assistant,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "Previous answer"}],
+        reasoning_details: [reasoning_detail],
+        metadata: %{response_id: "resp_prev_123"}
+      }
+
+      user_msg = %ReqLLM.Message{
+        role: :user,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "Follow up"}]
+      }
+
+      context = %ReqLLM.Context{messages: [assistant_msg, user_msg]}
+      request = build_request(context: context)
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      assert body["previous_response_id"] == "resp_prev_123"
+
+      refute Enum.any?(body["input"], fn item ->
+               item["type"] == "reasoning"
+             end)
+    end
+
+    test "skips non-OpenAI reasoning details with warning" do
+      import ExUnit.CaptureLog
+
+      anthropic_detail = %ReqLLM.Message.ReasoningDetails{
+        text: "Anthropic thinking",
+        signature: "anthro_sig",
+        encrypted?: false,
+        provider: :anthropic,
+        format: "anthropic-thinking-v1",
+        index: 0,
+        provider_data: %{}
+      }
+
+      assistant_msg = %ReqLLM.Message{
+        role: :assistant,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "Response"}],
+        reasoning_details: [anthropic_detail]
+      }
+
+      user_msg = %ReqLLM.Message{
+        role: :user,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "Next question"}]
+      }
+
+      context = %ReqLLM.Context{messages: [assistant_msg, user_msg]}
+      request = build_request(context: context)
+
+      log =
+        capture_log(fn ->
+          encoded = ResponsesAPI.encode_body(request)
+          body = Jason.decode!(encoded.body)
+
+          refute Enum.any?(body["input"], fn item ->
+                   item["type"] == "reasoning"
+                 end)
+        end)
+
+      assert log =~ "Skipping non-OpenAI reasoning detail from provider: :anthropic"
+    end
+
+    test "encodes reasoning detail without id when provider_data has no id" do
+      reasoning_detail = %ReqLLM.Message.ReasoningDetails{
+        text: "Reasoning text",
+        signature: "sig_123",
+        encrypted?: true,
+        provider: :openai,
+        format: "openai-responses-v1",
+        index: 0,
+        provider_data: %{}
+      }
+
+      assistant_msg = %ReqLLM.Message{
+        role: :assistant,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "Answer"}],
+        reasoning_details: [reasoning_detail]
+      }
+
+      user_msg = %ReqLLM.Message{
+        role: :user,
+        content: [%ReqLLM.Message.ContentPart{type: :text, text: "Question"}]
+      }
+
+      context = %ReqLLM.Context{messages: [assistant_msg, user_msg]}
+      request = build_request(context: context)
+
+      encoded = ResponsesAPI.encode_body(request)
+      body = Jason.decode!(encoded.body)
+
+      assert [reasoning_input | _rest] = body["input"]
+      assert reasoning_input["type"] == "reasoning"
+      assert reasoning_input["encrypted_content"] == "sig_123"
+      refute Map.has_key?(reasoning_input, "id")
     end
   end
 
@@ -717,5 +1126,99 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
     }
 
     {req, resp}
+  end
+
+  describe "ResponseBuilder - streaming reasoning_details extraction" do
+    alias ReqLLM.Providers.OpenAI.ResponsesAPI.ResponseBuilder
+
+    test "extracts reasoning_details from thinking chunks" do
+      {:ok, model} = ReqLLM.model("openai:gpt-4o")
+      context = %ReqLLM.Context{messages: []}
+
+      thinking_meta = %{
+        provider: :openai,
+        format: "openai-responses-v1",
+        encrypted?: false,
+        provider_data: %{"type" => "reasoning"}
+      }
+
+      chunks = [
+        ReqLLM.StreamChunk.thinking("Step 1: Analyze the problem", thinking_meta),
+        ReqLLM.StreamChunk.thinking("Step 2: Consider solutions", thinking_meta),
+        ReqLLM.StreamChunk.text("The answer is 42.")
+      ]
+
+      metadata = %{finish_reason: :stop, response_id: "resp_123"}
+
+      {:ok, response} =
+        ResponseBuilder.build_response(chunks, metadata, context: context, model: model)
+
+      assert response.message.reasoning_details != nil
+      assert length(response.message.reasoning_details) == 2
+
+      [first, second] = response.message.reasoning_details
+      assert %ReqLLM.Message.ReasoningDetails{} = first
+      assert first.text == "Step 1: Analyze the problem"
+      assert first.provider == :openai
+      assert first.format == "openai-responses-v1"
+      assert first.index == 0
+
+      assert second.text == "Step 2: Consider solutions"
+      assert second.index == 1
+    end
+
+    test "returns nil reasoning_details when no thinking chunks" do
+      {:ok, model} = ReqLLM.model("openai:gpt-4o")
+      context = %ReqLLM.Context{messages: []}
+
+      chunks = [
+        ReqLLM.StreamChunk.text("Just a simple response.")
+      ]
+
+      metadata = %{finish_reason: :stop}
+
+      {:ok, response} =
+        ResponseBuilder.build_response(chunks, metadata, context: context, model: model)
+
+      assert response.message.reasoning_details == nil
+    end
+
+    test "propagates response_id to message metadata" do
+      {:ok, model} = ReqLLM.model("openai:gpt-4o")
+      context = %ReqLLM.Context{messages: []}
+
+      chunks = [
+        ReqLLM.StreamChunk.thinking("Thinking..."),
+        ReqLLM.StreamChunk.text("Response")
+      ]
+
+      metadata = %{finish_reason: :stop, response_id: "resp_abc123"}
+
+      {:ok, response} =
+        ResponseBuilder.build_response(chunks, metadata, context: context, model: model)
+
+      assert response.message.metadata[:response_id] == "resp_abc123"
+      assert length(response.message.reasoning_details) == 1
+    end
+
+    test "attaches reasoning_details to context messages" do
+      {:ok, model} = ReqLLM.model("openai:gpt-4o")
+      context = %ReqLLM.Context{messages: []}
+
+      chunks = [
+        ReqLLM.StreamChunk.thinking("Deep thought"),
+        ReqLLM.StreamChunk.text("Final answer")
+      ]
+
+      metadata = %{finish_reason: :stop}
+
+      {:ok, response} =
+        ResponseBuilder.build_response(chunks, metadata, context: context, model: model)
+
+      [context_msg] = response.context.messages
+      assert context_msg.reasoning_details != nil
+      assert length(context_msg.reasoning_details) == 1
+      assert hd(context_msg.reasoning_details).text == "Deep thought"
+    end
   end
 end

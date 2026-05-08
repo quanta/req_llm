@@ -200,10 +200,8 @@ defmodule ReqLLM.Providers.Azure.Anthropic do
         "azure-anthropic"
       end
 
-    anthropic_model = %LLMDB.Model{
-      id: model_id,
-      provider: :anthropic
-    }
+    model_id = ReqLLM.ModelId.normalize(model_id, "azure-anthropic")
+    anthropic_model = LLMDB.Model.new!(%{id: model_id, provider: :anthropic})
 
     case Anthropic.Response.decode_response(body, anthropic_model) do
       {:ok, response} ->
@@ -283,7 +281,7 @@ defmodule ReqLLM.Providers.Azure.Anthropic do
         |> ensure_min_max_tokens(reasoning_budget)
         |> set_reasoning_temperature(model)
 
-      has_reasoning && reasoning_effort ->
+      has_reasoning && reasoning_effort && reasoning_effort != :none ->
         budget = Anthropic.map_reasoning_effort_to_budget(reasoning_effort)
 
         opts

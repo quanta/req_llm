@@ -77,7 +77,7 @@ defmodule ReqLLM.Providers.Google do
     default_env_key: "GOOGLE_API_KEY"
 
   import ReqLLM.Provider.Utils,
-    only: [maybe_put: 3, ensure_parsed_body: 1]
+    only: [maybe_put: 3, ensure_parsed_body: 1, sanitize_url: 1]
 
   require Logger
 
@@ -105,6 +105,11 @@ defmodule ReqLLM.Providers.Google do
       doc:
         "Enable Google Search grounding - allows model to search the web. Set to %{enable: true} for modern models, or %{dynamic_retrieval: %{mode: \"MODE_DYNAMIC\", dynamic_threshold: 0.7}} for Gemini 1.5 legacy support. Requires v1beta (default)."
     ],
+    google_url_context: [
+      type: {:or, [:boolean, :map]},
+      doc:
+        "Enable URL context grounding - allows model to fetch and use content from specific URLs. Pass `true` or a map with options. Requires v1beta (default)."
+    ],
     dimensions: [
       type: :pos_integer,
       doc:
@@ -119,6 +124,12 @@ defmodule ReqLLM.Providers.Google do
       type: :string,
       doc:
         "Reference to a previously created cached content. Use the cache name/ID returned from CachedContent creation API."
+    ],
+    google_auth_header: [
+      type: :boolean,
+      default: false,
+      doc:
+        "Use x-goog-api-key header for authentication instead of URL query parameter. Required for OpenAI-compatible API proxies."
     ]
   ]
 
@@ -140,16 +151,6 @@ defmodule ReqLLM.Providers.Google do
 
   defp resolve_api_version(opts) when is_list(opts) do
     provider = Keyword.get(opts, :provider_options, [])
-
-    case Keyword.get(provider, :google_api_version) do
-      "v1" -> "v1"
-      "v1beta" -> "v1beta"
-      _ -> nil
-    end
-  end
-
-  defp resolve_api_version(opts) when is_map(opts) do
-    provider = Map.get(opts, :provider_options, [])
 
     case Keyword.get(provider, :google_api_version) do
       "v1" -> "v1"
@@ -404,10 +405,103 @@ defmodule ReqLLM.Providers.Google do
     end
   end
 
+  def prepare_request(:image, model_spec, prompt, opts) do
+    with {:ok, model} <- ReqLLM.model(model_spec),
+         :ok <- validate_image_n(model, opts),
+         {:ok, context} <- image_context(prompt, opts),
+         opts_with_context = Keyword.put(opts, :context, context),
+         {:ok, processed_opts0} <-
+           ReqLLM.Provider.Options.process(__MODULE__, :image, model, opts_with_context),
+         :ok <- validate_version_feature_compat(processed_opts0) do
+      processed_opts =
+        Keyword.put(processed_opts0, :base_url, effective_base_url(processed_opts0))
+
+      processed_opts =
+        Keyword.put(processed_opts, :image_n_provided, Keyword.has_key?(opts, :n))
+
+      http_opts = Keyword.get(processed_opts, :req_http_options, [])
+
+      timeout =
+        Keyword.get(
+          processed_opts,
+          :receive_timeout,
+          Application.get_env(:req_llm, :image_receive_timeout, 120_000)
+        )
+
+      req_keys =
+        __MODULE__.supported_provider_options() ++
+          [
+            :context,
+            :operation,
+            :model,
+            :n,
+            :size,
+            :aspect_ratio,
+            :output_format,
+            :response_format,
+            :quality,
+            :style,
+            :seed,
+            :negative_prompt,
+            :user,
+            :provider_options,
+            :base_url,
+            :image_n_provided
+          ]
+
+      request =
+        Req.new(
+          [
+            url: "/models/#{model.id}:generateContent",
+            method: :post,
+            receive_timeout: timeout
+          ] ++ http_opts
+        )
+        |> Req.Request.register_options(req_keys)
+        |> Req.Request.merge_options(
+          Keyword.take(processed_opts, req_keys) ++
+            [
+              operation: :image,
+              model: model.id,
+              context: context,
+              base_url: processed_opts[:base_url]
+            ]
+        )
+        |> attach(model, processed_opts)
+
+      {:ok, request}
+    end
+  end
+
   # Delegate all other operations to defaults (which will return appropriate errors)
   def prepare_request(operation, model_spec, input, opts) do
     ReqLLM.Provider.Defaults.prepare_request(__MODULE__, operation, model_spec, input, opts)
   end
+
+  defp image_context(prompt, opts) do
+    case Keyword.get(opts, :context) do
+      %ReqLLM.Context{} = context -> {:ok, context}
+      _ -> ReqLLM.Context.normalize(prompt, opts)
+    end
+  end
+
+  defp validate_image_n(%LLMDB.Model{} = model, opts) do
+    if Keyword.has_key?(opts, :n) and image_n_forbidden?(model) do
+      {:error,
+       ReqLLM.Error.Invalid.Parameter.exception(
+         parameter:
+           "n is not supported for gemini-2.5-flash-image or gemini-3-pro-image-preview; specify the image count in the prompt"
+       )}
+    else
+      :ok
+    end
+  end
+
+  defp image_n_forbidden?(%LLMDB.Model{provider: :google, id: id}) do
+    id in ["gemini-2.5-flash-image", "gemini-3-pro-image-preview"]
+  end
+
+  defp image_n_forbidden?(_), do: false
 
   @impl ReqLLM.Provider
   def attach(%Req.Request{} = request, model_input, user_opts) do
@@ -440,6 +534,14 @@ defmodule ReqLLM.Providers.Google do
         :tools,
         :tool_choice,
         :n,
+        :prompt,
+        :size,
+        :aspect_ratio,
+        :output_format,
+        :response_format,
+        :quality,
+        :style,
+        :negative_prompt,
         :top_p,
         :top_k,
         :frequency_penalty,
@@ -468,14 +570,28 @@ defmodule ReqLLM.Providers.Google do
   end
 
   @impl ReqLLM.Provider
-  def extract_usage(body, _model) when is_map(body) do
+  def extract_usage(body, model) when is_map(body) do
     case body do
       %{"usageMetadata" => usage_metadata} ->
         usage = normalize_google_usage(usage_metadata)
+        tool_usage = google_tool_usage(body, model)
+        image_usage = google_image_usage(body)
+
+        usage =
+          usage
+          |> Map.put(:tool_usage, tool_usage)
+          |> maybe_put_image_usage(image_usage)
+
         {:ok, usage}
 
       _ ->
-        {:error, :no_usage_found}
+        image_usage = google_image_usage(body)
+
+        if map_size(image_usage) > 0 do
+          {:ok, %{image_usage: image_usage}}
+        else
+          {:error, :no_usage_found}
+        end
     end
   end
 
@@ -498,8 +614,56 @@ defmodule ReqLLM.Providers.Google do
       output_tokens: output,
       total_tokens: total,
       cached_tokens: cached,
-      reasoning_tokens: reasoning
+      reasoning_tokens: reasoning,
+      add_reasoning_to_cost: true
     }
+  end
+
+  defp google_tool_usage(body, model) do
+    queries =
+      body
+      |> Map.get("candidates", [])
+      |> Enum.flat_map(fn candidate ->
+        case get_in(candidate, ["groundingMetadata", "webSearchQueries"]) do
+          queries when is_list(queries) -> queries
+          _ -> []
+        end
+      end)
+
+    if queries == [] do
+      %{}
+    else
+      unit = ReqLLM.Pricing.tool_unit(model, :web_search)
+
+      count =
+        case unit do
+          :query -> length(queries)
+          "query" -> length(queries)
+          _ -> 1
+        end
+
+      ReqLLM.Usage.Tool.build(:web_search, count, unit)
+    end
+  end
+
+  defp google_image_usage(body) when is_map(body) do
+    candidates = Map.get(body, "candidates", [])
+
+    count =
+      Enum.reduce(candidates, 0, fn candidate, acc ->
+        parts = get_in(candidate, ["content", "parts"]) || []
+        acc + ReqLLM.Usage.Image.count_inline_parts(parts)
+      end)
+
+    ReqLLM.Usage.Image.build_generated(count)
+  end
+
+  defp maybe_put_image_usage(usage, image_usage) do
+    if map_size(image_usage) > 0 do
+      Map.put(usage, :image_usage, image_usage)
+    else
+      usage
+    end
   end
 
   def pre_validate_options(_operation, model, opts) do
@@ -530,9 +694,18 @@ defmodule ReqLLM.Providers.Google do
     {Keyword.put(rest, :provider_options, provider_opts), []}
   end
 
+  defp translate_reasoning_effort_to_budget(:none, _model), do: 0
+  defp translate_reasoning_effort_to_budget(:minimal, _model), do: 2_048
   defp translate_reasoning_effort_to_budget(:low, _model), do: 4_096
   defp translate_reasoning_effort_to_budget(:medium, _model), do: 8_192
   defp translate_reasoning_effort_to_budget(:high, _model), do: 16_384
+  defp translate_reasoning_effort_to_budget(:xhigh, _model), do: 32_768
+
+  defp translate_reasoning_effort_to_budget("none", model),
+    do: translate_reasoning_effort_to_budget(:none, model)
+
+  defp translate_reasoning_effort_to_budget("minimal", model),
+    do: translate_reasoning_effort_to_budget(:minimal, model)
 
   defp translate_reasoning_effort_to_budget("low", model),
     do: translate_reasoning_effort_to_budget(:low, model)
@@ -543,10 +716,35 @@ defmodule ReqLLM.Providers.Google do
   defp translate_reasoning_effort_to_budget("high", model),
     do: translate_reasoning_effort_to_budget(:high, model)
 
+  defp translate_reasoning_effort_to_budget("xhigh", model),
+    do: translate_reasoning_effort_to_budget(:xhigh, model)
+
   defp translate_reasoning_effort_to_budget(budget, _model) when is_integer(budget), do: budget
   defp translate_reasoning_effort_to_budget(_unknown, _model), do: 8_192
 
   @impl ReqLLM.Provider
+  def translate_options(:image, _model, opts) do
+    opts =
+      case {Keyword.get(opts, :aspect_ratio), Keyword.get(opts, :size)} do
+        {ratio, _} when is_binary(ratio) and ratio != "" ->
+          opts
+
+        {nil, {w, h}} when is_integer(w) and is_integer(h) ->
+          Keyword.put(opts, :aspect_ratio, infer_aspect_ratio(w, h))
+
+        {nil, size_str} when is_binary(size_str) ->
+          case parse_size(size_str) do
+            {:ok, {w, h}} -> Keyword.put(opts, :aspect_ratio, infer_aspect_ratio(w, h))
+            :error -> opts
+          end
+
+        _ ->
+          opts
+      end
+
+    {opts, []}
+  end
+
   def translate_options(_operation, _model, opts) do
     {reasoning_budget, opts} = Keyword.pop(opts, :reasoning_token_budget)
     {reasoning_effort, opts} = Keyword.pop(opts, :reasoning_effort)
@@ -585,6 +783,9 @@ defmodule ReqLLM.Providers.Google do
         :embedding ->
           encode_embedding_body(request)
 
+        :image ->
+          encode_image_body(request)
+
         :object ->
           encode_object_body(request)
 
@@ -604,6 +805,86 @@ defmodule ReqLLM.Providers.Google do
     end
   end
 
+  defp encode_image_body(request) do
+    {system_instruction, contents} =
+      case request.options[:context] do
+        %ReqLLM.Context{} = ctx ->
+          model_name = request.options[:model]
+          encoded = ReqLLM.Provider.Defaults.encode_context_to_openai_format(ctx, model_name)
+          messages = encoded[:messages] || encoded["messages"] || []
+          split_messages_for_gemini(messages)
+
+        _ ->
+          split_messages_for_gemini(request.options[:messages] || [])
+      end
+
+    # Note: We intentionally keep the role field in contents.
+    # Experiments show that including "role": "user" improves multi-image
+    # generation success rate (70% vs 50% for well-phrased prompts).
+
+    generation_config =
+      %{}
+      |> maybe_put_google_aspect_ratio(request.options[:aspect_ratio])
+      |> maybe_put(:candidateCount, image_candidate_count(request.options))
+
+    generation_config = if generation_config != %{}, do: generation_config
+
+    %{}
+    |> maybe_put(:systemInstruction, system_instruction)
+    |> Map.put(:contents, contents)
+    |> maybe_put(:generationConfig, generation_config)
+  end
+
+  defp image_candidate_count(opts) when is_list(opts) do
+    if Keyword.get(opts, :image_n_provided, false) do
+      case Keyword.fetch(opts, :n) do
+        {:ok, value} -> value
+        :error -> nil
+      end
+    end
+  end
+
+  defp image_candidate_count(opts) when is_map(opts) do
+    if Map.get(opts, :image_n_provided, false) and Map.has_key?(opts, :n) do
+      Map.get(opts, :n)
+    end
+  end
+
+  defp image_candidate_count(_), do: nil
+
+  defp maybe_put_google_aspect_ratio(config, nil), do: config
+
+  defp maybe_put_google_aspect_ratio(config, ratio) when is_binary(ratio) do
+    Map.put(
+      config,
+      "imageConfig",
+      Map.put(Map.get(config, "imageConfig", %{}), "aspectRatio", ratio)
+    )
+  end
+
+  defp maybe_put_google_aspect_ratio(config, _), do: config
+
+  defp parse_size(size) when is_binary(size) do
+    case String.split(size, "x") do
+      [w, h] ->
+        with {w_i, ""} <- Integer.parse(w),
+             {h_i, ""} <- Integer.parse(h),
+             true <- w_i > 0 and h_i > 0 do
+          {:ok, {w_i, h_i}}
+        else
+          _ -> :error
+        end
+
+      _ ->
+        :error
+    end
+  end
+
+  defp infer_aspect_ratio(w, h) when is_integer(w) and is_integer(h) and w > 0 and h > 0 do
+    gcd = Integer.gcd(w, h)
+    "#{div(w, gcd)}:#{div(h, gcd)}"
+  end
+
   defp encode_chat_body(request) do
     {system_instruction, contents} =
       case request.options[:context] do
@@ -620,28 +901,30 @@ defmodule ReqLLM.Providers.Google do
 
     tool_config = build_google_tool_config(request.options[:tool_choice])
 
+    grounding_tools = build_grounding_tools(request.options[:google_grounding])
+    url_context_tools = build_url_context_tools(request.options[:google_url_context])
+    builtin_tools = grounding_tools ++ url_context_tools
+
     tools_data =
       case request.options[:tools] do
         tools when is_list(tools) and tools != [] ->
-          grounding_tools = build_grounding_tools(request.options[:google_grounding])
-
           user_tools = [
             %{functionDeclarations: Enum.map(tools, &ReqLLM.Tool.to_schema(&1, :google))}
           ]
 
-          all_tools = grounding_tools ++ user_tools
+          all_tools = builtin_tools ++ user_tools
 
           %{tools: all_tools}
           |> maybe_put(:toolConfig, tool_config)
 
         _ ->
-          case build_grounding_tools(request.options[:google_grounding]) do
+          case builtin_tools do
             [] ->
               %{}
               |> maybe_put(:toolConfig, tool_config)
 
-            grounding_tools ->
-              %{tools: grounding_tools}
+            tools ->
+              %{tools: tools}
               |> maybe_put(:toolConfig, tool_config)
           end
       end
@@ -715,20 +998,14 @@ defmodule ReqLLM.Providers.Google do
 
     generation_config =
       %{
-        candidateCount: 1
+        candidateCount: 1,
+        responseMimeType: "application/json"
       }
       |> maybe_put(:temperature, request.options[:temperature])
       |> maybe_put(:maxOutputTokens, request.options[:max_tokens])
       |> maybe_put(:topP, request.options[:top_p])
       |> maybe_put(:topK, request.options[:top_k])
       |> maybe_add_thinking_config(request.options[:google_thinking_budget])
-      |> then(fn cfg ->
-        if include_response_mime?(request, model_name) do
-          Map.put(cfg, :responseMimeType, "application/json")
-        else
-          cfg
-        end
-      end)
       |> put_schema_for_model(model_name, compiled_schema)
 
     %{}
@@ -739,27 +1016,17 @@ defmodule ReqLLM.Providers.Google do
     |> maybe_put(:safetySettings, request.options[:google_safety_settings])
   end
 
-  defp gemini_2_5?(model_name) when is_binary(model_name) do
-    String.starts_with?(model_name, "gemini-2.5-") or model_name == "gemini-2.5"
+  defp json_schema_supported?(model_name) when is_binary(model_name) do
+    String.starts_with?(model_name, "gemini-2.5-") or model_name == "gemini-2.5" or
+      String.starts_with?(model_name, "gemini-3-") or model_name == "gemini-3"
   end
 
-  defp gemini_2_5?(_), do: false
-
-  defp gemini_2_0?(model_name) when is_binary(model_name) do
-    String.starts_with?(model_name, "gemini-2.0-") or model_name == "gemini-2.0"
-  end
-
-  defp gemini_2_0?(_), do: false
-
-  defp include_response_mime?(request, model_name) do
-    gemini_2_5?(model_name) or gemini_2_0?(model_name) or
-      resolve_api_version(request.options) == "v1beta"
-  end
+  defp json_schema_supported?(_), do: false
 
   defp put_schema_for_model(generation_config, model_name, compiled_schema) do
     json_schema = ReqLLM.Schema.to_json(compiled_schema.schema)
 
-    if gemini_2_5?(model_name) and json_schema?(json_schema) do
+    if json_schema_supported?(model_name) and json_schema?(json_schema) do
       Map.put(generation_config, :responseJsonSchema, json_schema)
     else
       google_schema = convert_to_google_schema(json_schema)
@@ -860,10 +1127,15 @@ defmodule ReqLLM.Providers.Google do
             normalized = normalize_embedding_response(body)
             {req, %{resp | body: normalized}}
 
-          :object when not is_streaming ->
-            model_name = req.options[:model]
-            model = %LLMDB.Model{id: model_name, provider: :google}
+          :image when not is_streaming ->
+            model_name = ReqLLM.ModelId.normalize(req.options[:model], "google")
+            body = ensure_parsed_body(resp.body)
+            merged_response = decode_image_response(req, model_name, body)
+            {req, %{resp | body: merged_response}}
 
+          :object when not is_streaming ->
+            model_name = ReqLLM.ModelId.normalize(req.options[:model], "google")
+            model = LLMDB.Model.new!(%{id: model_name, provider: :google})
             body = ensure_parsed_body(resp.body)
 
             openai_format = convert_google_json_mode_to_openai_format(body)
@@ -871,7 +1143,6 @@ defmodule ReqLLM.Providers.Google do
             {:ok, response} =
               ReqLLM.Provider.Defaults.decode_response_body_openai_format(openai_format, model)
 
-            # Extract and set object from JSON text content (like OpenAI json_schema mode)
             response_with_object =
               case ReqLLM.Response.unwrap_object(response) do
                 {:ok, object} -> %{response | object: object}
@@ -890,29 +1161,41 @@ defmodule ReqLLM.Providers.Google do
             ReqLLM.Provider.Defaults.default_decode_response({req, resp})
 
           _ ->
-            model_name = req.options[:model]
-            model = %LLMDB.Model{id: model_name, provider: :google}
+            model_name = ReqLLM.ModelId.normalize(req.options[:model], "google")
+            model = LLMDB.Model.new!(%{id: model_name, provider: :google})
 
             body = ensure_parsed_body(resp.body)
 
-            # Extract grounding metadata before format conversion to avoid duplication
             grounding_metadata = extract_grounding_metadata(body)
 
             openai_format = convert_google_to_openai_format(body)
 
+            reasoning_details = extract_reasoning_details_from_openai_format(openai_format)
+
             {:ok, response} =
               ReqLLM.Provider.Defaults.decode_response_body_openai_format(openai_format, model)
 
-            # Add grounding metadata to provider_meta["google"] if present
+            response_with_reasoning = attach_reasoning_details(response, reasoning_details)
+            tool_usage = google_tool_usage(body, model)
+            image_usage = google_image_usage(body)
+
+            response_with_usage =
+              add_usage_details(response_with_reasoning, tool_usage, image_usage)
+
             response_with_grounding =
               case grounding_metadata do
                 nil ->
-                  response
+                  response_with_usage
 
                 grounding_data ->
                   %{
-                    response
-                    | provider_meta: Map.put(response.provider_meta, "google", grounding_data)
+                    response_with_usage
+                    | provider_meta:
+                        Map.put(
+                          response_with_usage.provider_meta,
+                          "google",
+                          grounding_data
+                        )
                   }
               end
 
@@ -934,6 +1217,101 @@ defmodule ReqLLM.Providers.Google do
           )
 
         {req, err}
+    end
+  end
+
+  defp decode_image_response(req, model_name, %{} = body) do
+    parts = extract_candidate_parts(body)
+
+    content_parts =
+      parts
+      |> Enum.map(&decode_image_part/1)
+      |> Enum.reject(&is_nil/1)
+
+    message = %ReqLLM.Message{role: :assistant, content: content_parts}
+
+    usage =
+      case Map.get(body, "usageMetadata") do
+        usage_metadata when is_map(usage_metadata) -> normalize_google_usage(usage_metadata)
+        _ -> %{}
+      end
+
+    image_usage = google_image_usage(body)
+    usage = maybe_put_image_usage(usage, image_usage)
+    usage = if usage != %{}, do: usage
+
+    base_response = %ReqLLM.Response{
+      id: image_response_id(),
+      model: model_name,
+      context: req.options[:context] || %ReqLLM.Context{messages: []},
+      message: message,
+      object: nil,
+      stream?: false,
+      stream: nil,
+      usage: usage,
+      finish_reason: :stop,
+      provider_meta: %{"google" => Map.delete(body, "candidates")},
+      error: nil
+    }
+
+    ReqLLM.Context.merge_response(base_response.context, base_response)
+  end
+
+  defp extract_candidate_parts(%{"candidates" => candidates}) when is_list(candidates) do
+    Enum.flat_map(candidates, fn
+      %{"content" => %{"parts" => parts}} when is_list(parts) -> parts
+      _ -> []
+    end)
+  end
+
+  defp extract_candidate_parts(_), do: []
+
+  defp decode_image_part(%{"text" => text}) when is_binary(text) and text != "" do
+    %ReqLLM.Message.ContentPart{type: :text, text: text}
+  end
+
+  defp decode_image_part(%{"inlineData" => inline}) when is_map(inline) do
+    decode_inline_data(inline)
+  end
+
+  defp decode_image_part(%{"inline_data" => inline}) when is_map(inline) do
+    decode_inline_data(inline)
+  end
+
+  defp decode_image_part(_), do: nil
+
+  defp decode_inline_data(%{"data" => b64, "mimeType" => mime_type})
+       when is_binary(b64) and is_binary(mime_type) do
+    %ReqLLM.Message.ContentPart{type: :image, data: Base.decode64!(b64), media_type: mime_type}
+  end
+
+  defp decode_inline_data(%{"data" => b64, "mime_type" => mime_type})
+       when is_binary(b64) and is_binary(mime_type) do
+    %ReqLLM.Message.ContentPart{type: :image, data: Base.decode64!(b64), media_type: mime_type}
+  end
+
+  defp decode_inline_data(_), do: nil
+
+  defp image_response_id do
+    "img_" <> (:crypto.strong_rand_bytes(12) |> Base.url_encode64(padding: false))
+  end
+
+  defp add_usage_details(%ReqLLM.Response{} = response, tool_usage, image_usage) do
+    usage = response.usage
+
+    usage =
+      if map_size(tool_usage) > 0 do
+        Map.put(usage, :tool_usage, tool_usage)
+      else
+        usage
+      end
+
+    usage = maybe_put_image_usage(usage, image_usage)
+
+    if usage == %{} do
+      response
+    else
+      %{response | usage: usage}
     end
   end
 
@@ -969,6 +1347,10 @@ defmodule ReqLLM.Providers.Google do
   end
 
   defp build_grounding_tools(_), do: []
+
+  defp build_url_context_tools(true), do: [%{url_context: %{}}]
+  defp build_url_context_tools(%{} = opts), do: [%{url_context: opts}]
+  defp build_url_context_tools(_), do: []
 
   defp extract_grounding_metadata(%{"candidates" => [candidate | _]}) do
     case candidate do
@@ -1023,6 +1405,7 @@ defmodule ReqLLM.Providers.Google do
         %{"content" => %{"parts" => parts}} = candidate ->
           {content_parts, has_thinking?} = convert_google_parts_to_content(parts)
           tool_calls = extract_tool_calls(parts)
+          reasoning_details = extract_reasoning_details_from_parts(parts)
 
           message =
             if has_thinking? or tool_calls != [] do
@@ -1048,8 +1431,12 @@ defmodule ReqLLM.Providers.Google do
               _ -> Map.put(message, "tool_calls", tool_calls)
             end
 
-          # Google returns "STOP" even when there are function calls
-          # Override to "tool_calls" when function calls are present
+          message =
+            case reasoning_details do
+              [] -> message
+              details -> Map.put(message, "reasoning_details", details)
+            end
+
           finish_reason =
             case {tool_calls, candidate["finishReason"]} do
               {[_ | _], "STOP"} -> "tool_calls"
@@ -1081,7 +1468,8 @@ defmodule ReqLLM.Providers.Google do
     }
   end
 
-  defp convert_google_to_openai_format(body), do: body
+  defp convert_google_to_openai_format(body) when is_map(body), do: body
+  defp convert_google_to_openai_format(_body), do: %{}
 
   defp convert_google_json_mode_to_openai_format(%{"candidates" => candidates} = body) do
     choice =
@@ -1116,7 +1504,8 @@ defmodule ReqLLM.Providers.Google do
     }
   end
 
-  defp convert_google_json_mode_to_openai_format(body), do: body
+  defp convert_google_json_mode_to_openai_format(body) when is_map(body), do: body
+  defp convert_google_json_mode_to_openai_format(_body), do: %{}
 
   defp convert_google_parts_to_content(parts) do
     content_parts =
@@ -1153,6 +1542,54 @@ defmodule ReqLLM.Providers.Google do
       }
     end
   end
+
+  defp extract_reasoning_details_from_parts(parts) do
+    parts
+    |> Enum.filter(&(Map.get(&1, "thought", false) == true))
+    |> Enum.with_index()
+    |> Enum.map(fn {part, index} ->
+      %ReqLLM.Message.ReasoningDetails{
+        text: part["text"],
+        signature: part["thoughtSignature"],
+        encrypted?: part["thoughtSignature"] != nil,
+        provider: :google,
+        format: "google-gemini-v1",
+        index: index,
+        provider_data: %{"thought" => true}
+      }
+    end)
+  end
+
+  defp extract_reasoning_details_from_openai_format(%{"choices" => [first_choice | _]}) do
+    case first_choice do
+      %{"message" => %{"reasoning_details" => details}} when is_list(details) -> details
+      _ -> nil
+    end
+  end
+
+  defp extract_reasoning_details_from_openai_format(_), do: nil
+
+  defp attach_reasoning_details(response, nil), do: response
+  defp attach_reasoning_details(response, []), do: response
+
+  defp attach_reasoning_details(%ReqLLM.Response{message: message} = response, details)
+       when message != nil do
+    updated_message = %{message | reasoning_details: details}
+
+    updated_context =
+      case Enum.split(response.context.messages, -1) do
+        {init, [last]} when is_struct(last, ReqLLM.Message) and last.role == message.role ->
+          updated_last = %{last | reasoning_details: details}
+          %{response.context | messages: init ++ [updated_last]}
+
+        _ ->
+          response.context
+      end
+
+    %{response | message: updated_message, context: updated_context}
+  end
+
+  defp attach_reasoning_details(response, _details), do: response
 
   defp normalize_google_finish_reason("STOP"), do: "stop"
   defp normalize_google_finish_reason("MAX_TOKENS"), do: "length"
@@ -1195,10 +1632,28 @@ defmodule ReqLLM.Providers.Google do
   defp build_request_headers(_model, _opts), do: [{"Content-Type", "application/json"}]
 
   defp build_request_url(model_name, opts) do
-    api_key = ReqLLM.Keys.get!(opts[:model_struct] || opts[:model], opts)
     base_url = Keyword.fetch!(opts, :base_url)
 
-    "#{base_url}/models/#{model_name}:streamGenerateContent?key=#{api_key}&alt=sse"
+    if use_header_auth?(opts) do
+      "#{base_url}/models/#{model_name}:streamGenerateContent?alt=sse"
+    else
+      api_key = ReqLLM.Keys.get!(opts[:model_struct] || opts[:model], opts)
+      "#{base_url}/models/#{model_name}:streamGenerateContent?key=#{api_key}&alt=sse"
+    end
+  end
+
+  defp use_header_auth?(opts) do
+    provider_options = Keyword.get(opts, :provider_options, [])
+    Keyword.get(provider_options, :google_auth_header, false)
+  end
+
+  defp maybe_add_auth_header(headers, opts) do
+    if use_header_auth?(opts) do
+      api_key = ReqLLM.Keys.get!(opts[:model_struct] || opts[:model], opts)
+      [{"x-goog-api-key", api_key} | headers]
+    else
+      headers
+    end
   end
 
   defp build_request_body(model, context, opts) do
@@ -1269,11 +1724,14 @@ defmodule ReqLLM.Providers.Google do
 
       opts_with_base = Keyword.merge(processed_opts, base_url: base_url, model_struct: model)
 
-      headers = build_request_headers(model, opts_with_base) ++ [{"Accept", "text/event-stream"}]
+      base_headers =
+        build_request_headers(model, opts_with_base) ++ [{"Accept", "text/event-stream"}]
+
+      headers = maybe_add_auth_header(base_headers, opts_with_base)
       url = build_request_url(model.id, opts_with_base)
       body = build_request_body(model, context, processed_opts)
 
-      Logger.debug("Google attach_stream URL: #{inspect(url)}")
+      Logger.debug("Google attach_stream URL: #{inspect(sanitize_url(url))}")
 
       finch_request = Finch.build(:post, url, headers, body)
       {:ok, finch_request}
@@ -1356,6 +1814,8 @@ defmodule ReqLLM.Providers.Google do
           _ -> ""
         end
 
+      thought_parts = encode_reasoning_details_for_gemini(message)
+
       content_parts =
         case raw_content do
           content when is_binary(content) -> [%{text: content}]
@@ -1376,35 +1836,61 @@ defmodule ReqLLM.Providers.Google do
 
       tool_result_parts =
         case message do
+          %{tool_call_id: _call_id, role: "tool"} ->
+            [build_tool_result_part(message, raw_content)]
+
           %{"tool_call_id" => _call_id, "role" => "tool"} ->
-            [
-              %{
-                functionResponse: %{
-                  name: "unknown",
-                  response: %{content: extract_content_text(raw_content)}
-                }
-              }
-            ]
+            [build_tool_result_part(message, raw_content)]
 
           %{tool_call_id: _call_id, role: :tool} ->
-            [
-              %{
-                functionResponse: %{
-                  name: "unknown",
-                  response: %{content: extract_content_text(raw_content)}
-                }
-              }
-            ]
+            [build_tool_result_part(message, raw_content)]
 
           _ ->
             []
         end
 
-      parts = content_parts ++ tool_call_parts ++ tool_result_parts
+      parts = thought_parts ++ content_parts ++ tool_call_parts ++ tool_result_parts
 
       %{role: role, parts: parts}
     end)
   end
+
+  defp encode_reasoning_details_for_gemini(message) do
+    reasoning_details =
+      case message do
+        %{reasoning_details: details} when is_list(details) and details != [] -> details
+        %{"reasoning_details" => details} when is_list(details) and details != [] -> details
+        _ -> nil
+      end
+
+    case reasoning_details do
+      nil ->
+        []
+
+      details ->
+        details
+        |> Enum.sort_by(& &1.index)
+        |> Enum.flat_map(&encode_single_google_reasoning_detail/1)
+    end
+  end
+
+  defp encode_single_google_reasoning_detail(
+         %ReqLLM.Message.ReasoningDetails{provider: :google} = detail
+       ) do
+    part = %{text: detail.text || "", thought: true}
+    part = if detail.signature, do: Map.put(part, :thoughtSignature, detail.signature), else: part
+    [part]
+  end
+
+  defp encode_single_google_reasoning_detail(%ReqLLM.Message.ReasoningDetails{provider: provider}) do
+    Logger.debug(
+      "Skipping non-Google reasoning detail from provider: #{inspect(provider)} in Google request"
+    )
+
+    []
+  end
+
+  defp encode_single_google_reasoning_detail(_), do: []
 
   defp convert_tool_call_to_function_call(%ReqLLM.ToolCall{
          type: "function",
@@ -1446,6 +1932,37 @@ defmodule ReqLLM.Providers.Google do
 
   defp extract_content_text(_), do: ""
 
+  defp build_tool_result_part(message, raw_content) do
+    %{
+      functionResponse: %{
+        name: tool_result_name(message),
+        response: tool_result_response(message, raw_content)
+      }
+    }
+  end
+
+  defp tool_result_name(%{name: name}) when is_binary(name) and name != "", do: name
+  defp tool_result_name(%{"name" => name}) when is_binary(name) and name != "", do: name
+  defp tool_result_name(_), do: "unknown"
+
+  defp tool_result_response(message, raw_content) do
+    output = ReqLLM.ToolResult.output_from_message(message)
+
+    cond do
+      is_map(output) or is_list(output) ->
+        output
+
+      is_binary(output) ->
+        %{content: output}
+
+      output != nil ->
+        %{content: to_string(output)}
+
+      true ->
+        %{content: extract_content_text(raw_content)}
+    end
+  end
+
   # Extract text content from a message for system instruction
   defp extract_text_content(%{content: content}) when is_binary(content), do: content
   defp extract_text_content(%{"content" => content}) when is_binary(content), do: content
@@ -1474,26 +1991,54 @@ defmodule ReqLLM.Providers.Google do
   end
 
   # Handle OpenAI-format image_url (from Provider.Defaults.encode_openai_content_part)
-  defp convert_content_part(%{type: "image_url", image_url: %{url: url}}) when is_binary(url) do
-    # Parse data URI format: data:mime/type;base64,<data>
-    case String.split(url, ",", parts: 2) do
-      [header, base64_data] ->
-        mime_type =
-          case Regex.run(~r/data:([^;]+)/, header) do
-            [_, type] -> type
-            _ -> "image/jpeg"
-          end
+  defp convert_content_part(%{type: "image_url", image_url: %{url: url}} = part)
+       when is_binary(url) do
+    cond do
+      # Data URI format: data:mime/type;base64,<data>
+      String.starts_with?(url, "data:") ->
+        case String.split(url, ",", parts: 2) do
+          [header, base64_data] ->
+            mime_type =
+              case Regex.run(~r/data:([^;]+)/, header) do
+                [_, type] -> type
+                _ -> "image/jpeg"
+              end
+
+            %{
+              inline_data: %{
+                mime_type: mime_type,
+                data: base64_data
+              }
+            }
+
+          _ ->
+            %{text: "[Malformed data URI]"}
+        end
+
+      # HTTP/HTTPS URL: use fileData.fileUri (Google-native URL support)
+      String.starts_with?(url, "http://") or String.starts_with?(url, "https://") ->
+        mime_type = get_mime_type_from_part(part, url)
 
         %{
-          inline_data: %{
-            mime_type: mime_type,
-            data: base64_data
+          fileData: %{
+            fileUri: url,
+            mimeType: mime_type
           }
         }
 
-      _ ->
-        # Not a data URI, might be a URL
-        %{text: "[Unsupported image URL]"}
+      # GCS URI: gs://bucket/path
+      String.starts_with?(url, "gs://") ->
+        mime_type = get_mime_type_from_part(part, url)
+
+        %{
+          fileData: %{
+            fileUri: url,
+            mimeType: mime_type
+          }
+        }
+
+      true ->
+        %{text: "[Unsupported URL scheme: #{String.slice(url, 0, 20)}...]"}
     end
   end
 
@@ -1521,6 +2066,35 @@ defmodule ReqLLM.Providers.Google do
 
   defp convert_content_part(part), do: %{text: to_string(part)}
 
+  # Helper to extract mime type from part metadata or infer from URL extension
+  defp get_mime_type_from_part(part, url) do
+    # Try metadata first (if passed through from ContentPart)
+    case part do
+      %{image_url: %{media_type: type}} when is_binary(type) -> type
+      _ -> infer_mime_type_from_url(url)
+    end
+  end
+
+  defp infer_mime_type_from_url(url) do
+    # Strip query params and get extension
+    path = url |> URI.parse() |> Map.get(:path, "") |> to_string()
+
+    case Path.extname(path) |> String.downcase() do
+      ".jpg" -> "image/jpeg"
+      ".jpeg" -> "image/jpeg"
+      ".png" -> "image/png"
+      ".gif" -> "image/gif"
+      ".webp" -> "image/webp"
+      ".pdf" -> "application/pdf"
+      ".mp3" -> "audio/mpeg"
+      ".mp4" -> "video/mp4"
+      ".m4a" -> "audio/mp4"
+      ".wav" -> "audio/wav"
+      # Fallback
+      _ -> "application/octet-stream"
+    end
+  end
+
   # Decode Google streaming events.
   #
   # Google's :streamGenerateContent endpoint returns JSON array format (not SSE) for 2.5 models.
@@ -1528,6 +2102,10 @@ defmodule ReqLLM.Providers.Google do
   # - SSE format: %{data: {...}}
   # - JSON array element: raw map from parsed JSON array
   defp decode_google_event(data, model) when is_map(data) do
+    # Extract grounding metadata if present (for Google Search grounding)
+    grounding_data = extract_grounding_metadata(data)
+    provider_meta = if grounding_data, do: %{"google" => grounding_data}
+
     case data do
       %{
         "candidates" => [%{"content" => %{"parts" => parts}, "finishReason" => finish_reason} | _],
@@ -1536,15 +2114,15 @@ defmodule ReqLLM.Providers.Google do
       when finish_reason != nil ->
         chunks = extract_chunks_from_parts(parts)
 
-        usage_chunk =
-          ReqLLM.StreamChunk.meta(%{
-            usage: convert_google_usage_for_streaming(usage),
-            finish_reason: normalize_google_finish_reason(finish_reason),
-            model: model.id,
-            terminal?: true
-          })
+        meta = %{
+          usage: convert_google_usage_for_streaming(usage),
+          finish_reason: normalize_google_finish_reason(finish_reason),
+          model: model.id,
+          terminal?: true
+        }
 
-        chunks ++ [usage_chunk]
+        meta = if provider_meta, do: Map.put(meta, :provider_meta, provider_meta), else: meta
+        chunks ++ [ReqLLM.StreamChunk.meta(meta)]
 
       %{
         "candidates" => [%{"content" => %{"parts" => parts}, "finishReason" => finish_reason} | _]
@@ -1552,36 +2130,43 @@ defmodule ReqLLM.Providers.Google do
       when finish_reason != nil ->
         chunks = extract_chunks_from_parts(parts)
 
-        meta_chunk =
-          ReqLLM.StreamChunk.meta(%{
-            finish_reason: normalize_google_finish_reason(finish_reason),
-            terminal?: true
-          })
+        meta = %{
+          finish_reason: normalize_google_finish_reason(finish_reason),
+          terminal?: true
+        }
 
-        chunks ++ [meta_chunk]
+        meta = if provider_meta, do: Map.put(meta, :provider_meta, provider_meta), else: meta
+        chunks ++ [ReqLLM.StreamChunk.meta(meta)]
 
       %{"candidates" => [%{"content" => %{"parts" => parts}} | _], "usageMetadata" => usage} ->
         chunks = extract_chunks_from_parts(parts)
 
-        usage_chunk =
-          ReqLLM.StreamChunk.meta(%{
-            usage: convert_google_usage_for_streaming(usage),
-            model: model.id
-          })
+        meta = %{
+          usage: convert_google_usage_for_streaming(usage),
+          model: model.id
+        }
 
-        chunks ++ [usage_chunk]
+        meta = if provider_meta, do: Map.put(meta, :provider_meta, provider_meta), else: meta
+        chunks ++ [ReqLLM.StreamChunk.meta(meta)]
 
       %{"candidates" => [%{"content" => %{"parts" => parts}} | _]} ->
-        extract_chunks_from_parts(parts)
+        chunks = extract_chunks_from_parts(parts)
+
+        if provider_meta do
+          chunks ++ [ReqLLM.StreamChunk.meta(%{provider_meta: provider_meta})]
+        else
+          chunks
+        end
 
       %{"usageMetadata" => usage} ->
-        [
-          ReqLLM.StreamChunk.meta(%{
-            usage: convert_google_usage_for_streaming(usage),
-            model: model.id,
-            terminal?: true
-          })
-        ]
+        meta = %{
+          usage: convert_google_usage_for_streaming(usage),
+          model: model.id,
+          terminal?: true
+        }
+
+        meta = if provider_meta, do: Map.put(meta, :provider_meta, provider_meta), else: meta
+        [ReqLLM.StreamChunk.meta(meta)]
 
       _ ->
         []
@@ -1599,7 +2184,9 @@ defmodule ReqLLM.Providers.Google do
             []
           else
             if Map.get(part, "thought", false) do
-              [ReqLLM.StreamChunk.thinking(text)]
+              signature = Map.get(part, "thoughtSignature")
+              meta = if signature, do: %{signature: signature}, else: %{}
+              [ReqLLM.StreamChunk.thinking(text, meta)]
             else
               [ReqLLM.StreamChunk.text(text)]
             end

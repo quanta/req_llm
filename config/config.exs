@@ -13,9 +13,12 @@ config :llm_db,
       groq: ["*"],
       openai: ["*"],
       openrouter: ["*"],
+      venice: ["*"],
       xai: ["*"],
       zai: ["*"],
-      zai_coder: ["*"]
+      zai_coder: ["*"],
+      zai_coding_plan: ["*"],
+      zenmux: ["*"]
     },
     deny: %{
       anthropic: [
@@ -94,6 +97,42 @@ if System.get_env("REQ_LLM_DEBUG") in ~w(1 true yes on) do
   config :logger, level: :debug
 
   config :req_llm, :debug, true
+end
+
+# Git hooks and git_ops for conventional commits (dev only)
+if config_env() == :dev do
+  config :git_hooks,
+    auto_install: true,
+    verbose: true,
+    hooks: [
+      commit_msg: [
+        tasks: [
+          {:cmd, "mix git_ops.check_message", include_hook_args: true}
+        ]
+      ],
+      pre_push: [
+        tasks: [
+          {:mix_task, :format, ["--check-formatted"]}
+        ]
+      ]
+    ]
+
+  config :git_ops,
+    mix_project: ReqLLM.MixProject,
+    changelog_file: "CHANGELOG.md",
+    repository_url: "https://github.com/agentjido/req_llm",
+    manage_mix_version?: true,
+    version_tag_prefix: "v",
+    types: [
+      feat: [header: "Features"],
+      fix: [header: "Bug Fixes"],
+      perf: [header: "Performance"],
+      refactor: [header: "Refactoring"],
+      docs: [hidden?: true],
+      test: [hidden?: true],
+      chore: [hidden?: true],
+      ci: [hidden?: true]
+    ]
 end
 
 if config_env() in [:dev, :test] do

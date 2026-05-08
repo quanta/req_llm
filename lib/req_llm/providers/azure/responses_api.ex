@@ -42,8 +42,7 @@ defmodule ReqLLM.Providers.Azure.ResponsesAPI do
       }
     }
 
-    encoded_request = ResponsesAPI.encode_body(fake_request)
-    Jason.decode!(encoded_request.body)
+    ResponsesAPI.build_body(fake_request)
   end
 
   @doc """
@@ -81,7 +80,12 @@ defmodule ReqLLM.Providers.Azure.ResponsesAPI do
   Delegates to the native OpenAI ResponsesAPI.
   """
   def decode_stream_event(event, model) do
-    ResponsesAPI.decode_stream_event(event, model)
+    {chunks, _state} = decode_stream_event(event, model, nil)
+    chunks
+  end
+
+  def decode_stream_event(event, model, state) do
+    ResponsesAPI.decode_stream_event(event, model, state)
   end
 
   @doc """

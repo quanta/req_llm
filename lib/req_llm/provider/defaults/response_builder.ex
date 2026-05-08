@@ -59,12 +59,20 @@ defmodule ReqLLM.Provider.Defaults.ResponseBuilder do
     thinking_content = acc_data.thinking_content |> Enum.reverse() |> Enum.join("")
     content_parts = build_content_parts(text_content, thinking_content, normalized_tool_calls)
 
+    # Build reasoning_details: prefer from meta chunks, fall back to extraction from thinking chunks
+    reasoning_details =
+      case acc_data.reasoning_details do
+        [] -> extract_reasoning_from_thinking_chunks(chunks, model.provider)
+        details -> details
+      end
+
     # Build message
     message = %Message{
       role: :assistant,
       content: content_parts,
       tool_calls: if(normalized_tool_calls != [], do: normalized_tool_calls),
-      metadata: build_message_metadata(metadata)
+      metadata: build_message_metadata(metadata),
+      reasoning_details: reasoning_details
     }
 
     # Extract structured object if present
@@ -107,7 +115,13 @@ defmodule ReqLLM.Provider.Defaults.ResponseBuilder do
   def accumulate_chunks(chunks) do
     Enum.reduce(
       chunks,
-      %{text_content: [], thinking_content: [], tool_calls: [], arg_fragments: %{}},
+      %{
+        text_content: [],
+        thinking_content: [],
+        tool_calls: [],
+        arg_fragments: %{},
+        reasoning_details: []
+      },
       &accumulate_chunk/2
     )
   end
@@ -132,10 +146,19 @@ defmodule ReqLLM.Provider.Defaults.ResponseBuilder do
   end
 
   defp accumulate_chunk(%StreamChunk{type: :meta, metadata: meta}, acc) do
+    acc =
+      case meta do
+        %{tool_call_args: %{index: index, fragment: fragment}} ->
+          existing = Map.get(acc.arg_fragments, index, "")
+          %{acc | arg_fragments: Map.put(acc.arg_fragments, index, existing <> fragment)}
+
+        _ ->
+          acc
+      end
+
     case meta do
-      %{tool_call_args: %{index: index, fragment: fragment}} ->
-        existing = Map.get(acc.arg_fragments, index, "")
-        %{acc | arg_fragments: Map.put(acc.arg_fragments, index, existing <> fragment)}
+      %{reasoning_details: details} when is_list(details) ->
+        %{acc | reasoning_details: acc.reasoning_details ++ details}
 
       _ ->
         acc
@@ -348,4 +371,34 @@ defmodule ReqLLM.Provider.Defaults.ResponseBuilder do
   defp normalize_finish_reason("incomplete"), do: :incomplete
   # Fallback to :unknown for any unrecognized values to prevent atom table exhaustion
   defp normalize_finish_reason(_other), do: :unknown
+
+  defp extract_reasoning_from_thinking_chunks(chunks, _provider) do
+    thinking_chunks =
+      Enum.filter(chunks, fn
+        %StreamChunk{type: :thinking} -> true
+        _ -> false
+      end)
+
+    case thinking_chunks do
+      [] ->
+        nil
+
+      chunks_list ->
+        chunks_list
+        |> Enum.with_index()
+        |> Enum.map(fn {chunk, index} ->
+          meta = chunk.metadata
+
+          %Message.ReasoningDetails{
+            text: chunk.text,
+            signature: meta[:signature],
+            encrypted?: meta[:encrypted?],
+            provider: meta[:provider],
+            format: meta[:format],
+            index: index,
+            provider_data: meta[:provider_data]
+          }
+        end)
+    end
+  end
 end

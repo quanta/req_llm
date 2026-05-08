@@ -79,6 +79,13 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
     end
   end
 
+  def supports_forced_tool_choice?(model_spec) do
+    case ReqLLM.model(model_spec) do
+      {:ok, model} -> get_in(model.capabilities, [:tools, :forced_choice]) != false
+      {:error, _} -> true
+    end
+  end
+
   defmacro __using__(opts) do
     provider = Keyword.fetch!(opts, :provider)
 
@@ -239,7 +246,7 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
               case ReqLLM.model(@model_spec) do
                 {:ok, %{capabilities: %{reasoning: true}}} -> 500
                 {:ok, %{model: "gpt-4.1" <> _}} -> 16
-                {:ok, %{extra: %{api: "responses"}}} -> 200
+                {:ok, %{extra: %{wire: %{protocol: "openai_responses"}}}} -> 200
                 _ -> 10
               end
 
@@ -406,6 +413,14 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
                 param_bundles().deterministic
                 |> Keyword.put(:max_tokens, tool_budget_for(@model_spec))
 
+              # Use forced tool choice if supported, otherwise fall back to "required"
+              tool_choice =
+                if ReqLLM.ProviderTest.Comprehensive.supports_forced_tool_choice?(@model_spec) do
+                  %{type: "tool", name: "add"}
+                else
+                  "required"
+                end
+
               {:ok, resp1} =
                 ReqLLM.generate_text(
                   @model_spec,
@@ -415,7 +430,7 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
                     base_opts ++
                       [
                         tools: tools,
-                        tool_choice: %{type: "tool", name: "add"}
+                        tool_choice: tool_choice
                       ]
                   )
                 )
@@ -638,6 +653,8 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
               last = List.last(response.context.messages)
               assert last == response.message
 
+              assert_reasoning_details_if_present(response.message)
+
               context =
                 ReqLLM.Context.new([
                   system(provider_config.reasoning_prompts.streaming_system),
@@ -700,9 +717,36 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
 
               assert %ReqLLM.Response{} = response
               assert response.message.role == :assistant
+
+              assert_reasoning_details_if_present(response.message)
             end
           end
         end
+      end
+
+      defp assert_reasoning_details_if_present(%ReqLLM.Message{reasoning_details: nil}), do: :ok
+      defp assert_reasoning_details_if_present(%ReqLLM.Message{reasoning_details: []}), do: :ok
+
+      defp assert_reasoning_details_if_present(%ReqLLM.Message{reasoning_details: details})
+           when is_list(details) do
+        for {detail, idx} <- Enum.with_index(details) do
+          assert %ReqLLM.Message.ReasoningDetails{} = detail,
+                 "reasoning_details[#{idx}] should be a ReasoningDetails struct, got: #{inspect(detail)}"
+
+          assert detail.provider in [:anthropic, :google, :openai, :openrouter],
+                 "reasoning_details[#{idx}].provider should be a known provider atom, got: #{inspect(detail.provider)}"
+
+          assert is_binary(detail.format) and detail.format != "",
+                 "reasoning_details[#{idx}].format should be a non-empty string, got: #{inspect(detail.format)}"
+
+          assert is_integer(detail.index) and detail.index >= 0,
+                 "reasoning_details[#{idx}].index should be a non-negative integer, got: #{inspect(detail.index)}"
+
+          assert is_boolean(detail.encrypted?),
+                 "reasoning_details[#{idx}].encrypted? should be a boolean, got: #{inspect(detail.encrypted?)}"
+        end
+
+        :ok
       end
     end
   end

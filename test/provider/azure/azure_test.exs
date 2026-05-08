@@ -4,7 +4,7 @@ defmodule ReqLLM.Providers.AzureTest do
 
   Tests Azure-specific provider behaviors:
   - Deployment-based URL construction
-  - api-key header authentication (not Bearer token)
+  - api-key header authentication and Bearer token authentication
   - API version handling
   - Model family routing (OpenAI vs Anthropic)
   - Option translation delegation
@@ -115,7 +115,7 @@ defmodule ReqLLM.Providers.AzureTest do
   end
 
   describe "attach/3" do
-    test "sets api-key header instead of Bearer token" do
+    test "sets api-key header for regular api keys" do
       {:ok, model} = ReqLLM.model("azure:gpt-4o")
       context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
 
@@ -131,6 +131,53 @@ defmodule ReqLLM.Providers.AzureTest do
 
       assert Req.Request.get_header(request, "api-key") == ["test-api-key"]
       refute Req.Request.get_header(request, "authorization") |> Enum.any?(&(&1 =~ "Bearer"))
+    end
+
+    test "sets Authorization Bearer header when api_key starts with 'Bearer '" do
+      {:ok, model} = ReqLLM.model("azure:gpt-4o")
+      context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
+
+      request =
+        Req.new(url: "/test", method: :post)
+        |> Req.Request.register_options([:context, :api_key, :base_url])
+        |> Req.Request.merge_options(context: context)
+        |> Azure.attach(model,
+          api_key: "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.test",
+          context: context,
+          base_url: "https://my-resource.openai.azure.com/openai"
+        )
+
+      assert Req.Request.get_header(request, "authorization") == [
+               "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.test"
+             ]
+
+      assert Req.Request.get_header(request, "api-key") == []
+    end
+
+    test "Bearer token takes precedence over model family for Claude models" do
+      model = %LLMDB.Model{
+        id: "claude-3-5-sonnet-20241022",
+        provider: :azure,
+        capabilities: %{chat: true}
+      }
+
+      context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
+
+      request =
+        Req.new(url: "/test", method: :post)
+        |> Req.Request.register_options([:context, :api_key, :base_url])
+        |> Req.Request.merge_options(context: context)
+        |> Azure.attach(model,
+          api_key: "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.test",
+          context: context,
+          base_url: "https://my-resource.openai.azure.com/openai"
+        )
+
+      assert Req.Request.get_header(request, "authorization") == [
+               "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.test"
+             ]
+
+      assert Req.Request.get_header(request, "x-api-key") == []
     end
 
     test "sets content-type header" do
@@ -185,6 +232,53 @@ defmodule ReqLLM.Providers.AzureTest do
       header_map = Map.new(finch_request.headers)
       assert header_map["api-key"] == "test-api-key"
       assert header_map["content-type"] == "application/json"
+    end
+
+    test "uses Authorization Bearer header when api_key starts with 'Bearer '" do
+      {:ok, model} = ReqLLM.model("azure:gpt-4o")
+      context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
+
+      {:ok, finch_request} =
+        Azure.attach_stream(
+          model,
+          context,
+          [
+            api_key: "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.test",
+            deployment: "my-deployment",
+            base_url: "https://my-resource.openai.azure.com/openai"
+          ],
+          :req_llm_finch
+        )
+
+      header_map = Map.new(finch_request.headers)
+      assert header_map["authorization"] == "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.test"
+      refute Map.has_key?(header_map, "api-key")
+    end
+
+    test "Bearer token takes precedence for Claude models in streaming" do
+      model = %LLMDB.Model{
+        id: "claude-3-5-sonnet-20241022",
+        provider: :azure,
+        capabilities: %{chat: true}
+      }
+
+      context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
+
+      {:ok, finch_request} =
+        Azure.attach_stream(
+          model,
+          context,
+          [
+            api_key: "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.test",
+            deployment: "claude-deployment",
+            base_url: "https://my-resource.openai.azure.com/openai"
+          ],
+          :req_llm_finch
+        )
+
+      header_map = Map.new(finch_request.headers)
+      assert header_map["authorization"] == "Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.test"
+      refute Map.has_key?(header_map, "x-api-key")
     end
 
     test "does not include anthropic-version header for OpenAI models" do
@@ -604,6 +698,45 @@ defmodule ReqLLM.Providers.AzureTest do
     end
   end
 
+  describe "verbosity option" do
+    test "OpenAI models include verbosity when provided as atom" do
+      context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
+      opts = [stream: false, provider_options: [verbosity: :low]]
+
+      body = Azure.OpenAI.format_request("gpt-4o", context, opts)
+
+      assert body[:verbosity] == "low"
+    end
+
+    test "OpenAI models include verbosity when provided as string" do
+      context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
+      opts = [stream: false, provider_options: [verbosity: "high"]]
+
+      body = Azure.OpenAI.format_request("gpt-4o", context, opts)
+
+      assert body[:verbosity] == "high"
+    end
+
+    test "OpenAI models omit verbosity when not provided" do
+      context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
+      opts = [stream: false]
+
+      body = Azure.OpenAI.format_request("gpt-4o", context, opts)
+
+      refute Map.has_key?(body, :verbosity)
+    end
+
+    test "verbosity works with reasoning models" do
+      context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
+      opts = [stream: false, provider_options: [verbosity: :medium, reasoning_effort: "high"]]
+
+      body = Azure.OpenAI.format_request("o3-mini", context, opts)
+
+      assert body[:verbosity] == "medium"
+      assert body[:reasoning_effort] == "high"
+    end
+  end
+
   describe "reasoning model features" do
     import ExUnit.CaptureLog
 
@@ -818,6 +951,85 @@ defmodule ReqLLM.Providers.AzureTest do
       api_key_header = get_header(request.headers, "api-key")
       assert api_key_header == "test-api-key" or api_key_header == "  test-api-key  "
     end
+
+    test "rejects empty Bearer token" do
+      {:ok, model} = ReqLLM.model("azure:gpt-4o")
+
+      assert_raise ReqLLM.Error.Invalid.Parameter, ~r/Bearer token cannot be empty/, fn ->
+        Azure.prepare_request(
+          :chat,
+          model,
+          "Hello",
+          api_key: "Bearer ",
+          base_url: "https://my-resource.openai.azure.com/openai"
+        )
+      end
+    end
+
+    test "rejects Bearer token with only whitespace" do
+      {:ok, model} = ReqLLM.model("azure:gpt-4o")
+
+      assert_raise ReqLLM.Error.Invalid.Parameter, ~r/Bearer token cannot be empty/, fn ->
+        Azure.prepare_request(
+          :chat,
+          model,
+          "Hello",
+          api_key: "Bearer    ",
+          base_url: "https://my-resource.openai.azure.com/openai"
+        )
+      end
+    end
+
+    test "rejects Bearer token with newline characters (header injection protection)" do
+      {:ok, model} = ReqLLM.model("azure:gpt-4o")
+
+      assert_raise ReqLLM.Error.Invalid.Parameter,
+                   ~r/Bearer token contains invalid characters/,
+                   fn ->
+                     Azure.prepare_request(
+                       :chat,
+                       model,
+                       "Hello",
+                       api_key: "Bearer token\nX-Injected-Header: malicious",
+                       base_url: "https://my-resource.openai.azure.com/openai"
+                     )
+                   end
+    end
+
+    test "rejects Bearer token with carriage return characters" do
+      {:ok, model} = ReqLLM.model("azure:gpt-4o")
+
+      assert_raise ReqLLM.Error.Invalid.Parameter,
+                   ~r/Bearer token contains invalid characters/,
+                   fn ->
+                     Azure.prepare_request(
+                       :chat,
+                       model,
+                       "Hello",
+                       api_key: "Bearer token\r\nX-Injected-Header: malicious",
+                       base_url: "https://my-resource.openai.azure.com/openai"
+                     )
+                   end
+    end
+
+    test "trims whitespace from Bearer token value" do
+      {:ok, model} = ReqLLM.model("azure:gpt-4o")
+      context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
+
+      request =
+        Req.new(url: "/test", method: :post)
+        |> Req.Request.register_options([:context, :api_key, :base_url])
+        |> Req.Request.merge_options(context: context)
+        |> Azure.attach(model,
+          api_key: "Bearer   eyJhbGciOiJSUzI1NiJ9.test   ",
+          context: context,
+          base_url: "https://my-resource.openai.azure.com/openai"
+        )
+
+      assert Req.Request.get_header(request, "authorization") == [
+               "Bearer eyJhbGciOiJSUzI1NiJ9.test"
+             ]
+    end
   end
 
   defp get_header(headers, key) do
@@ -825,6 +1037,389 @@ defmodule ReqLLM.Providers.AzureTest do
       {_, [value | _]} -> value
       {_, value} when is_binary(value) -> value
       nil -> nil
+    end
+  end
+
+  describe "Azure AI Foundry format detection" do
+    test "detects Foundry format from .services.ai.azure.com domain" do
+      assert Azure.uses_foundry_format?("https://my-resource.services.ai.azure.com")
+      assert Azure.uses_foundry_format?("https://test.services.ai.azure.com/some/path")
+      assert Azure.uses_foundry_format?("https://resource-name.services.ai.azure.com/")
+    end
+
+    test "does not detect Foundry format for traditional Azure OpenAI domains" do
+      refute Azure.uses_foundry_format?("https://my-resource.openai.azure.com/openai")
+      refute Azure.uses_foundry_format?("https://my-resource.cognitiveservices.azure.com")
+      refute Azure.uses_foundry_format?("https://example.com")
+    end
+
+    test "handles edge cases safely" do
+      refute Azure.uses_foundry_format?(nil)
+      refute Azure.uses_foundry_format?("")
+      refute Azure.uses_foundry_format?("not-a-url")
+      refute Azure.uses_foundry_format?(12_345)
+    end
+
+    test "uses Foundry URL path for .services.ai.azure.com domain" do
+      {:ok, model} = ReqLLM.model("azure:deepseek-v3.1")
+
+      {:ok, request} =
+        Azure.prepare_request(
+          :chat,
+          model,
+          "Hello",
+          deployment: "deepseek-v3",
+          base_url: "https://my-resource.services.ai.azure.com",
+          api_key: "test-key"
+        )
+
+      url_string = URI.to_string(request.url)
+      assert url_string =~ "/models/chat/completions"
+      refute url_string =~ "/deployments/"
+    end
+
+    test "uses traditional URL path for .openai.azure.com domain" do
+      {:ok, model} = ReqLLM.model("azure:gpt-4o")
+
+      {:ok, request} =
+        Azure.prepare_request(
+          :chat,
+          model,
+          "Hello",
+          deployment: "my-deployment",
+          base_url: "https://my-resource.openai.azure.com/openai",
+          api_key: "test-key"
+        )
+
+      url_string = URI.to_string(request.url)
+      assert url_string =~ "/deployments/my-deployment/chat/completions"
+      refute url_string =~ "/models/chat/completions"
+    end
+
+    test "adds model to request body for Foundry format" do
+      {:ok, model} = ReqLLM.model("azure:deepseek-v3.1")
+
+      {:ok, request} =
+        Azure.prepare_request(
+          :chat,
+          model,
+          "Hello",
+          deployment: "deepseek-v3-deployment",
+          base_url: "https://my-resource.services.ai.azure.com",
+          api_key: "test-key"
+        )
+
+      # Extract the JSON body from the request
+      body = get_json_body(request)
+      assert body["model"] == "deepseek-v3-deployment"
+    end
+
+    test "does not add model to request body for traditional format" do
+      {:ok, model} = ReqLLM.model("azure:gpt-4o")
+
+      {:ok, request} =
+        Azure.prepare_request(
+          :chat,
+          model,
+          "Hello",
+          deployment: "my-deployment",
+          base_url: "https://my-resource.openai.azure.com/openai",
+          api_key: "test-key"
+        )
+
+      # Extract the JSON body from the request
+      body = get_json_body(request)
+      refute Map.has_key?(body, "model")
+    end
+
+    test "uses Foundry URL path for embeddings on .services.ai.azure.com domain" do
+      model = %LLMDB.Model{
+        id: "text-embedding-3-small",
+        provider: :azure,
+        capabilities: %{embeddings: true}
+      }
+
+      {:ok, request} =
+        Azure.prepare_request(
+          :embedding,
+          model,
+          "Hello",
+          deployment: "my-embedding-deployment",
+          base_url: "https://my-resource.services.ai.azure.com",
+          api_key: "test-key"
+        )
+
+      url_string = URI.to_string(request.url)
+      assert url_string =~ "/models/embeddings"
+      refute url_string =~ "/deployments/"
+    end
+
+    test "uses traditional URL path for embeddings on .openai.azure.com domain" do
+      model = %LLMDB.Model{
+        id: "text-embedding-3-small",
+        provider: :azure,
+        capabilities: %{embeddings: true}
+      }
+
+      {:ok, request} =
+        Azure.prepare_request(
+          :embedding,
+          model,
+          "Hello",
+          deployment: "my-embedding-deployment",
+          base_url: "https://my-resource.openai.azure.com/openai",
+          api_key: "test-key"
+        )
+
+      url_string = URI.to_string(request.url)
+      assert url_string =~ "/deployments/my-embedding-deployment/embeddings"
+      refute url_string =~ "/models/embeddings"
+    end
+
+    test "streaming uses Foundry URL path for .services.ai.azure.com domain" do
+      {:ok, model} = ReqLLM.model("azure:deepseek-v3.1")
+      context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
+
+      {:ok, finch_request} =
+        Azure.attach_stream(
+          model,
+          context,
+          [
+            api_key: "test-api-key",
+            deployment: "deepseek-v3-deployment",
+            base_url: "https://my-resource.services.ai.azure.com"
+          ],
+          :req_llm_finch
+        )
+
+      url_string =
+        case finch_request do
+          %{path: path, query: query} when is_binary(query) and query != "" ->
+            path <> "?" <> query
+
+          %{path: path} ->
+            path
+        end
+
+      assert url_string =~ "/models/chat/completions"
+      refute url_string =~ "/deployments/"
+    end
+
+    test "streaming uses traditional URL path for .openai.azure.com domain" do
+      {:ok, model} = ReqLLM.model("azure:gpt-4o")
+      context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
+
+      {:ok, finch_request} =
+        Azure.attach_stream(
+          model,
+          context,
+          [
+            api_key: "test-api-key",
+            deployment: "my-deployment",
+            base_url: "https://my-resource.openai.azure.com/openai"
+          ],
+          :req_llm_finch
+        )
+
+      url_string =
+        case finch_request do
+          %{path: path, query: query} when is_binary(query) and query != "" ->
+            path <> "?" <> query
+
+          %{path: path} ->
+            path
+        end
+
+      assert url_string =~ "/deployments/my-deployment/chat/completions"
+      refute url_string =~ "/models/chat/completions"
+    end
+
+    test "streaming adds model to request body for Foundry format" do
+      {:ok, model} = ReqLLM.model("azure:deepseek-v3.1")
+      context = ReqLLM.Context.new([ReqLLM.Context.user("Hello")])
+
+      {:ok, finch_request} =
+        Azure.attach_stream(
+          model,
+          context,
+          [
+            api_key: "test-api-key",
+            deployment: "deepseek-v3-deployment",
+            base_url: "https://my-resource.services.ai.azure.com"
+          ],
+          :req_llm_finch
+        )
+
+      # Decode the JSON body from the Finch request
+      body = Jason.decode!(finch_request.body)
+      assert body["model"] == "deepseek-v3-deployment"
+    end
+  end
+
+  defp get_json_body(%Req.Request{} = request) do
+    # Req stores JSON body in options[:json] before encoding
+    request.options[:json] || %{}
+  end
+
+  describe "ResponseBuilder - streaming reasoning_details extraction" do
+    alias ReqLLM.Provider.Defaults.ResponseBuilder
+
+    test "extracts reasoning_details from thinking chunks for OpenAI models" do
+      {:ok, model} = ReqLLM.model("azure:gpt-4o")
+      context = %ReqLLM.Context{messages: []}
+
+      thinking_meta = %{
+        provider: :openai,
+        format: "openai-chat-v1",
+        encrypted?: false,
+        provider_data: %{"type" => "reasoning"}
+      }
+
+      chunks = [
+        ReqLLM.StreamChunk.thinking("Step 1: Analyze the problem", thinking_meta),
+        ReqLLM.StreamChunk.thinking("Step 2: Consider solutions", thinking_meta),
+        ReqLLM.StreamChunk.text("The answer is 42.")
+      ]
+
+      metadata = %{finish_reason: :stop}
+
+      {:ok, response} =
+        ResponseBuilder.build_response(chunks, metadata, context: context, model: model)
+
+      assert response.message.reasoning_details != nil
+      assert length(response.message.reasoning_details) == 2
+
+      [first, second] = response.message.reasoning_details
+      assert %ReqLLM.Message.ReasoningDetails{} = first
+      assert first.text == "Step 1: Analyze the problem"
+      assert first.provider == :openai
+      assert first.format == "openai-chat-v1"
+      assert first.index == 0
+
+      assert second.text == "Step 2: Consider solutions"
+      assert second.index == 1
+    end
+
+    test "extracts reasoning_details from thinking chunks for Claude models on Azure" do
+      model = %LLMDB.Model{
+        id: "claude-3-5-sonnet-20241022",
+        provider: :azure,
+        capabilities: %{chat: true}
+      }
+
+      context = %ReqLLM.Context{messages: []}
+
+      thinking_meta = %{
+        provider: :anthropic,
+        format: "anthropic-thinking-v1",
+        encrypted?: false,
+        provider_data: %{"type" => "thinking"}
+      }
+
+      chunks = [
+        ReqLLM.StreamChunk.thinking("Let me think through this", thinking_meta),
+        ReqLLM.StreamChunk.text("Here is my answer.")
+      ]
+
+      metadata = %{finish_reason: :stop}
+
+      {:ok, response} =
+        ResponseBuilder.build_response(chunks, metadata, context: context, model: model)
+
+      assert response.message.reasoning_details != nil
+      assert length(response.message.reasoning_details) == 1
+
+      [first] = response.message.reasoning_details
+      assert first.text == "Let me think through this"
+      assert first.provider == :anthropic
+      assert first.format == "anthropic-thinking-v1"
+      assert first.index == 0
+    end
+
+    test "returns nil reasoning_details when no thinking chunks" do
+      {:ok, model} = ReqLLM.model("azure:gpt-4o")
+      context = %ReqLLM.Context{messages: []}
+
+      chunks = [
+        ReqLLM.StreamChunk.text("Just a simple response.")
+      ]
+
+      metadata = %{finish_reason: :stop}
+
+      {:ok, response} =
+        ResponseBuilder.build_response(chunks, metadata, context: context, model: model)
+
+      assert response.message.reasoning_details == nil
+    end
+  end
+
+  describe "Sync flow - reasoning_details extraction" do
+    alias ReqLLM.Providers.Azure.Anthropic, as: AzureAnthropic
+
+    test "extracts reasoning_details from Claude response on Azure (sync flow)" do
+      model = %LLMDB.Model{
+        id: "claude-3-5-sonnet-20241022",
+        provider: :azure,
+        capabilities: %{chat: true}
+      }
+
+      anthropic_response_body = %{
+        "id" => "msg_01XFDUDYJgAACzvnptvVoYEL",
+        "type" => "message",
+        "role" => "assistant",
+        "model" => "claude-3-5-sonnet-20241022",
+        "content" => [
+          %{"type" => "thinking", "thinking" => "Let me analyze this step by step"},
+          %{"type" => "thinking", "thinking" => "Considering the options"},
+          %{"type" => "text", "text" => "Here is my answer."}
+        ],
+        "stop_reason" => "end_turn",
+        "usage" => %{
+          "input_tokens" => 10,
+          "output_tokens" => 50
+        }
+      }
+
+      {:ok, response} = AzureAnthropic.parse_response(anthropic_response_body, model, [])
+
+      assert response.message.reasoning_details != nil
+      assert length(response.message.reasoning_details) == 2
+
+      [first, second] = response.message.reasoning_details
+      assert first.text == "Let me analyze this step by step"
+      assert first.provider == :anthropic
+      assert first.format == "anthropic-thinking-v1"
+      assert first.index == 0
+
+      assert second.text == "Considering the options"
+      assert second.index == 1
+    end
+
+    test "returns nil reasoning_details when no thinking content (sync flow)" do
+      model = %LLMDB.Model{
+        id: "claude-3-5-sonnet-20241022",
+        provider: :azure,
+        capabilities: %{chat: true}
+      }
+
+      anthropic_response_body = %{
+        "id" => "msg_01XFDUDYJgAACzvnptvVoYEL",
+        "type" => "message",
+        "role" => "assistant",
+        "model" => "claude-3-5-sonnet-20241022",
+        "content" => [
+          %{"type" => "text", "text" => "Just a simple response."}
+        ],
+        "stop_reason" => "end_turn",
+        "usage" => %{
+          "input_tokens" => 10,
+          "output_tokens" => 20
+        }
+      }
+
+      {:ok, response} = AzureAnthropic.parse_response(anthropic_response_body, model, [])
+
+      assert response.message.reasoning_details == nil
     end
   end
 end

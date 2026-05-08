@@ -63,22 +63,30 @@ defmodule ReqLLM.Tool do
 
   """
 
-  use TypedStruct
-
   @type callback_mfa :: {module(), atom()} | {module(), atom(), list()}
   @type callback_fun :: (map() -> {:ok, term()} | {:error, term()})
   @type callback :: callback_mfa() | callback_fun()
 
-  typedstruct enforce: true do
-    @typedoc "A tool definition for AI model function calling"
+  @schema Zoi.struct(__MODULE__, %{
+            name: Zoi.string() |> Zoi.required(),
+            description: Zoi.string() |> Zoi.required(),
+            parameter_schema: Zoi.any() |> Zoi.default([]),
+            compiled: Zoi.any() |> Zoi.default(nil),
+            callback: Zoi.any() |> Zoi.required(),
+            strict: Zoi.boolean() |> Zoi.default(false),
+            tool_type: Zoi.string() |> Zoi.nullable() |> Zoi.default(nil),
+            defer_loading: Zoi.boolean() |> Zoi.default(false),
+            allowed_callers: Zoi.any() |> Zoi.nullable() |> Zoi.default(nil),
+            provider_options: Zoi.any() |> Zoi.nullable() |> Zoi.default(nil)
+          })
 
-    field(:name, String.t(), enforce: true)
-    field(:description, String.t(), enforce: true)
-    field(:parameter_schema, keyword() | map(), default: [])
-    field(:compiled, term() | nil, default: nil)
-    field(:callback, callback(), enforce: true)
-    field(:strict, boolean(), default: false)
-  end
+  @typedoc "A tool definition for AI model function calling"
+  @type t :: unquote(Zoi.type_spec(@schema))
+
+  @enforce_keys Zoi.Struct.enforce_keys(@schema)
+  defstruct Zoi.Struct.struct_fields(@schema)
+
+  def schema, do: @schema
 
   @type tool_opts :: [
           name: String.t(),
@@ -114,6 +122,29 @@ defmodule ReqLLM.Tool do
                    type: :boolean,
                    default: false,
                    doc: "Enable strict mode for OpenAI structured outputs"
+                 ],
+                 tool_type: [
+                   type: {:custom, __MODULE__, :validate_tool_type, []},
+                   default: nil,
+                   doc: "Custom tool type (e.g., 'memory_20250818' for Anthropic memory tools)"
+                 ],
+                 defer_loading: [
+                   type: :boolean,
+                   default: false,
+                   doc:
+                     "When true, the tool is deferred for on-demand discovery via Anthropic's tool search feature"
+                 ],
+                 allowed_callers: [
+                   type: :any,
+                   default: nil,
+                   doc:
+                     "List of caller tool types permitted to invoke this tool (e.g., [\"code_execution_20250825\"] for programmatic tool calling)"
+                 ],
+                 provider_options: [
+                   type: :any,
+                   default: nil,
+                   doc:
+                     "Provider-specific tool fields merged into the emitted schema (e.g., %{model: \"claude-opus-4-7\"} for Anthropic advisor tool)"
                  ]
                )
 
@@ -171,7 +202,11 @@ defmodule ReqLLM.Tool do
         parameter_schema: validated_opts[:parameter_schema],
         compiled: compiled_schema,
         callback: validated_opts[:callback],
-        strict: validated_opts[:strict] || false
+        strict: validated_opts[:strict] || false,
+        tool_type: validated_opts[:tool_type],
+        defer_loading: validated_opts[:defer_loading] || false,
+        allowed_callers: validated_opts[:allowed_callers],
+        provider_options: validated_opts[:provider_options]
       }
 
       {:ok, tool}
@@ -224,6 +259,7 @@ defmodule ReqLLM.Tool do
 
   Validates input parameters against the tool's schema and calls the callback function.
   The callback is expected to return `{:ok, result}` or `{:error, reason}`.
+  Tool results can be plain text, structured data, content parts, or a `ReqLLM.ToolResult`.
 
   ## Parameters
 
@@ -316,11 +352,14 @@ defmodule ReqLLM.Tool do
   @doc """
   Validates a tool name for compliance with function calling standards.
 
-  Tool names must be valid identifiers (alphanumeric + underscores, start with letter/underscore).
+  Tool names must be valid identifiers (alphanumeric, underscores, or hyphens, start with letter/underscore).
 
   ## Examples
 
       ReqLLM.Tool.valid_name?("get_weather")
+      #=> true
+
+      ReqLLM.Tool.valid_name?("get-weather")
       #=> true
 
       ReqLLM.Tool.valid_name?("123invalid")
@@ -329,10 +368,17 @@ defmodule ReqLLM.Tool do
   """
   @spec valid_name?(String.t()) :: boolean()
   def valid_name?(name) when is_binary(name) do
-    Regex.match?(~r/^[a-zA-Z_][a-zA-Z0-9_]*$/, name) and String.length(name) <= 64
+    Regex.match?(~r/^[a-zA-Z_][a-zA-Z0-9_]*(-[a-zA-Z0-9_]+)*$/, name) and
+      String.length(name) <= 64
   end
 
   def valid_name?(_), do: false
+
+  @doc false
+  def validate_tool_type(nil), do: {:ok, nil}
+  def validate_tool_type(value) when is_binary(value), do: {:ok, value}
+
+  def validate_tool_type(value), do: {:error, "expected string or nil, got: #{inspect(value)}"}
 
   # Private functions
 
@@ -341,7 +387,7 @@ defmodule ReqLLM.Tool do
       :ok
     else
       {:error,
-       "Invalid tool name: #{inspect(name)}. Must be valid identifier (alphanumeric + underscore, max 64 chars)"}
+       "Invalid tool name: #{inspect(name)}. Must be valid identifier (alphanumeric, underscore, or hyphen, max 64 chars)"}
     end
   end
 

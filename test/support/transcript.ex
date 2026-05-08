@@ -14,8 +14,6 @@ defmodule ReqLLM.Test.Transcript do
   - `{:done, :ok}` - Response complete
   """
 
-  use TypedStruct
-
   @typedoc "HTTP event in the transcript"
   @type event ::
           {:status, pos_integer()}
@@ -23,14 +21,21 @@ defmodule ReqLLM.Test.Transcript do
           | {:data, binary()}
           | {:done, :ok}
 
-  typedstruct do
-    field(:provider, atom(), enforce: true)
-    field(:model_spec, binary(), enforce: true)
-    field(:captured_at, DateTime.t(), enforce: true)
-    field(:request, map(), enforce: true)
-    field(:response_meta, map(), enforce: true)
-    field(:events, [event()], enforce: true)
-  end
+  @schema Zoi.struct(__MODULE__, %{
+            provider: Zoi.atom() |> Zoi.required(),
+            model_spec: Zoi.string() |> Zoi.required(),
+            captured_at: Zoi.any() |> Zoi.required(),
+            request: Zoi.map() |> Zoi.required(),
+            response_meta: Zoi.map() |> Zoi.required(),
+            events: Zoi.list(Zoi.any()) |> Zoi.required()
+          })
+
+  @type t :: unquote(Zoi.type_spec(@schema))
+
+  @enforce_keys Zoi.Struct.enforce_keys(@schema)
+  defstruct Zoi.Struct.struct_fields(@schema)
+
+  def schema, do: @schema
 
   @sensitive_headers ~w(authorization x-api-key api-key)
   # Use exact matches to avoid false positives (e.g., max_tokens matching "token")
@@ -429,28 +434,7 @@ defmodule ReqLLM.Test.Transcript do
   defp sanitize_json(list) when is_list(list), do: Enum.map(list, &sanitize_json/1)
   defp sanitize_json(other), do: other
 
-  defp sanitize_url(url) when is_binary(url) do
-    uri = URI.parse(url)
-
-    if uri.query do
-      sanitized_query =
-        URI.decode_query(uri.query)
-        |> Enum.map(fn {k, v} ->
-          if String.downcase(k) in ["key", "api_key", "apikey", "access_token", "token"] do
-            {k, "[REDACTED:#{k}]"}
-          else
-            {k, v}
-          end
-        end)
-        |> URI.encode_query()
-
-      %{uri | query: sanitized_query} |> URI.to_string()
-    else
-      url
-    end
-  end
-
-  defp sanitize_url(url), do: url
+  defp sanitize_url(url), do: ReqLLM.Provider.Utils.sanitize_url(url)
 
   defp normalize_headers(h) when is_list(h), do: h
   defp normalize_headers(h) when is_map(h), do: Enum.to_list(h)

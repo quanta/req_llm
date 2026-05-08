@@ -3,6 +3,7 @@ defmodule ReqLLM.MessageTest do
 
   alias ReqLLM.Message
   alias ReqLLM.Message.ContentPart
+  alias ReqLLM.Message.ReasoningDetails
 
   describe "struct creation and validation" do
     test "creates message with required role field" do
@@ -301,6 +302,66 @@ defmodule ReqLLM.MessageTest do
       assert String.to_atom(decoded.role) == :assistant
       assert length(decoded.content) == 2
       assert decoded.metadata.priority == "high"
+    end
+  end
+
+  describe "ReasoningDetails" do
+    test "creates struct with all fields" do
+      detail = %ReasoningDetails{
+        text: "Let me think...",
+        signature: "abc123",
+        encrypted?: true,
+        provider: :anthropic,
+        format: "anthropic-thinking-v1",
+        index: 0,
+        provider_data: %{"raw" => "data"}
+      }
+
+      assert detail.text == "Let me think..."
+      assert detail.signature == "abc123"
+      assert detail.encrypted? == true
+      assert detail.provider == :anthropic
+      assert detail.format == "anthropic-thinking-v1"
+      assert detail.index == 0
+      assert detail.provider_data == %{"raw" => "data"}
+    end
+
+    test "defaults encrypted? to false" do
+      detail = %ReasoningDetails{text: "thinking"}
+      assert detail.encrypted? == false
+    end
+
+    test "defaults provider_data to empty map" do
+      detail = %ReasoningDetails{text: "thinking"}
+      assert detail.provider_data == %{}
+    end
+
+    test "defaults index to 0" do
+      detail = %ReasoningDetails{text: "thinking"}
+      assert detail.index == 0
+    end
+
+    test "JSON encodes correctly" do
+      detail = %ReasoningDetails{
+        text: "reasoning",
+        signature: "sig123",
+        encrypted?: true,
+        provider: :openai,
+        format: "openai-reasoning-v1",
+        index: 1,
+        provider_data: %{"extra" => "field"}
+      }
+
+      json = Jason.encode!(detail)
+      decoded = Jason.decode!(json)
+
+      assert decoded["text"] == "reasoning"
+      assert decoded["signature"] == "sig123"
+      assert decoded["encrypted?"] == true
+      assert decoded["provider"] == "openai"
+      assert decoded["format"] == "openai-reasoning-v1"
+      assert decoded["index"] == 1
+      assert decoded["provider_data"] == %{"extra" => "field"}
     end
   end
 end

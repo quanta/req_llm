@@ -112,12 +112,10 @@ defmodule ReqLLM.Providers.GoogleVertex.Anthropic do
   def parse_response(body, %LLMDB.Model{} = vertex_model, opts) when is_map(body) do
     # Create an Anthropic model struct for decode_response
     # Use the model ID from the response body, or fall back to the Vertex model
-    model_id = Map.get(body, "model", vertex_model.id)
+    model_id =
+      ReqLLM.ModelId.normalize(Map.get(body, "model") || vertex_model, "vertex-anthropic")
 
-    anthropic_model = %LLMDB.Model{
-      id: model_id,
-      provider: :anthropic
-    }
+    anthropic_model = LLMDB.Model.new!(%{id: model_id, provider: :anthropic})
 
     # Delegate to native Anthropic response decoding
     case Anthropic.Response.decode_response(body, anthropic_model) do
@@ -169,7 +167,7 @@ defmodule ReqLLM.Providers.GoogleVertex.Anthropic do
           |> ensure_min_max_tokens(reasoning_budget)
           |> Keyword.put(:temperature, 1.0)
 
-        reasoning_effort ->
+        reasoning_effort && reasoning_effort != :none ->
           # Map effort to budget using canonical Anthropic mappings
           budget = Anthropic.map_reasoning_effort_to_budget(reasoning_effort)
 
@@ -179,7 +177,7 @@ defmodule ReqLLM.Providers.GoogleVertex.Anthropic do
           |> Keyword.put(:temperature, 1.0)
 
         true ->
-          # No reasoning params
+          # No reasoning params or :none (disable reasoning)
           opts
       end
     else

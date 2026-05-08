@@ -75,10 +75,11 @@ Define tools once; invoke across providers with a unified call/result shape.
 
 Example:
 ```elixir
-tool = ReqLLM.Tool.new(
+{:ok, tool} = ReqLLM.Tool.new(
   name: "get_weather",
   description: "Gets weather by city",
-  schema: [city: [type: :string, required: true]]
+  parameter_schema: [city: [type: :string, required: true]],
+  callback: fn %{city: city} -> {:ok, "Weather in #{city}: sunny"} end
 )
 
 {:ok, response} =

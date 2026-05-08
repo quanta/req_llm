@@ -44,12 +44,94 @@ defmodule ReqLLM.Providers.Azure.OpenAI do
   require Logger
   require ReqLLM.Debug, as: Debug
 
-  @openai_model_prefixes ["gpt", "o1", "o3", "o4", "text-embedding"]
+  # Model prefixes that use OpenAI-compatible API format
+  @openai_compatible_prefixes ["gpt", "o1", "o3", "o4", "text-embedding", "deepseek", "mai-ds"]
+
+  @anthropic_specific_options [
+    :anthropic_prompt_cache,
+    :anthropic_prompt_cache_ttl,
+    :anthropic_version
+  ]
+
+  @doc """
+  Pre-validates and transforms options for OpenAI models on Azure.
+  Warns if Anthropic-specific options are passed.
+  """
+  def pre_validate_options(_operation, _model, opts) do
+    opts
+    |> warn_and_remove_anthropic_options()
+    |> warn_and_remove_anthropic_thinking_config()
+    |> then(&{&1, []})
+  end
+
+  defp warn_and_remove_anthropic_options(opts) do
+    case opts[:provider_options] do
+      provider_opts when is_list(provider_opts) ->
+        found_anthropic_opts =
+          @anthropic_specific_options
+          |> Enum.filter(&Keyword.has_key?(provider_opts, &1))
+
+        if found_anthropic_opts == [] do
+          opts
+        else
+          Logger.warning(
+            "Options #{inspect(found_anthropic_opts)} are Anthropic-specific and are ignored for OpenAI models on Azure."
+          )
+
+          updated_provider_opts = Keyword.drop(provider_opts, found_anthropic_opts)
+
+          Keyword.put(opts, :provider_options, updated_provider_opts)
+        end
+
+      _ ->
+        opts
+    end
+  end
+
+  defp warn_and_remove_anthropic_thinking_config(opts) do
+    case opts[:provider_options] do
+      provider_opts when is_list(provider_opts) ->
+        amrf = provider_opts[:additional_model_request_fields]
+
+        case amrf do
+          %{thinking: _} ->
+            warn_and_remove_thinking(opts, provider_opts, amrf)
+
+          %{"thinking" => _} ->
+            warn_and_remove_thinking(opts, provider_opts, amrf)
+
+          _ ->
+            opts
+        end
+
+      _ ->
+        opts
+    end
+  end
+
+  defp warn_and_remove_thinking(opts, provider_opts, amrf) do
+    Logger.warning(
+      "additional_model_request_fields with thinking config is Anthropic-specific " <>
+        "and is ignored for OpenAI models on Azure. " <>
+        "For OpenAI reasoning models, use reasoning_effort instead."
+    )
+
+    updated_amrf = Map.drop(amrf, [:thinking, "thinking"])
+
+    updated_provider_opts =
+      if map_size(updated_amrf) == 0 do
+        Keyword.delete(provider_opts, :additional_model_request_fields)
+      else
+        Keyword.put(provider_opts, :additional_model_request_fields, updated_amrf)
+      end
+
+    Keyword.put(opts, :provider_options, updated_provider_opts)
+  end
 
   @doc """
   Formats a ReqLLM context into OpenAI Chat Completions request format.
 
-  Delegates encoding to `ReqLLM.Provider.Defaults.default_encode_body/1` then
+  Delegates encoding to `ReqLLM.Provider.Defaults.default_build_body/1` then
   applies Azure-specific modifications:
   - Removes `model` field (Azure uses deployment-based routing)
   - Adds token limits appropriate for model type (reasoning vs standard)
@@ -76,21 +158,16 @@ defmodule ReqLLM.Providers.Azure.OpenAI do
         )
       )
 
-    encoded_request = Defaults.default_encode_body(temp_request)
-
-    body =
-      case encoded_request.body do
-        "" -> %{}
-        json_string -> Jason.decode!(json_string)
-      end
+    body = Defaults.default_build_body(temp_request)
 
     final_body =
       body
-      |> Map.delete("model")
+      |> Map.drop([:model, "model"])
       |> AdapterHelpers.add_token_limits(model_id, opts)
       |> maybe_put(:n, opts[:n])
       |> maybe_put(:reasoning_effort, provider_opts[:reasoning_effort])
       |> maybe_put(:service_tier, provider_opts[:service_tier])
+      |> add_verbosity(provider_opts)
       |> add_stream_options(opts)
       |> AdapterHelpers.add_parallel_tool_calls(opts, provider_opts)
       |> AdapterHelpers.translate_tool_choice_format()
@@ -106,10 +183,10 @@ defmodule ReqLLM.Providers.Azure.OpenAI do
   end
 
   defp warn_if_non_openai_model(model_id) do
-    if !Enum.any?(@openai_model_prefixes, &String.starts_with?(model_id, &1)) do
+    if !Enum.any?(@openai_compatible_prefixes, &String.starts_with?(model_id, &1)) do
       Logger.warning(
-        "Model '#{model_id}' does not appear to be an OpenAI model. " <>
-          "Expected prefix: #{Enum.join(@openai_model_prefixes, ", ")}. " <>
+        "Model '#{model_id}' does not appear to be OpenAI-compatible. " <>
+          "Expected prefix: #{Enum.join(@openai_compatible_prefixes, ", ")}. " <>
           "Proceeding with OpenAI formatting (may fail)."
       )
     end
@@ -122,6 +199,15 @@ defmodule ReqLLM.Providers.Azure.OpenAI do
       body
     end
   end
+
+  defp add_verbosity(body, provider_opts) do
+    verbosity = provider_opts[:verbosity]
+    maybe_put(body, :verbosity, normalize_verbosity(verbosity))
+  end
+
+  defp normalize_verbosity(nil), do: nil
+  defp normalize_verbosity(v) when is_atom(v), do: Atom.to_string(v)
+  defp normalize_verbosity(v) when is_binary(v), do: v
 
   @doc """
   Formats an embedding request for Azure OpenAI.

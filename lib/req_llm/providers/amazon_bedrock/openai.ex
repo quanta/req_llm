@@ -55,15 +55,19 @@ defmodule ReqLLM.Providers.AmazonBedrock.OpenAI do
         )
       )
 
-    encoded_request = Defaults.default_encode_body(temp_request)
+    body = Defaults.default_build_body(temp_request)
 
-    # Parse the body and remove "name" field from tool messages
-    # Bedrock OpenAI models don't support the "name" field in tool responses
-    body = Jason.decode!(encoded_request.body)
+    messages = body[:messages] || body["messages"]
 
     updated_body =
-      if messages = body["messages"] do
-        Map.put(body, "messages", strip_name_from_tool_messages(messages))
+      if is_list(messages) do
+        updated_messages = strip_name_from_tool_messages(messages)
+
+        if is_map_key(body, :messages) do
+          Map.put(body, :messages, updated_messages)
+        else
+          Map.put(body, "messages", updated_messages)
+        end
       else
         body
       end
@@ -71,11 +75,13 @@ defmodule ReqLLM.Providers.AmazonBedrock.OpenAI do
     updated_body
   end
 
-  # Strip the "name" field from tool role messages (Bedrock OpenAI limitation)
   defp strip_name_from_tool_messages(messages) when is_list(messages) do
     Enum.map(messages, fn message ->
-      if message["role"] == "tool" do
-        Map.delete(message, "name")
+      role = message[:role] || message["role"]
+
+      if role == "tool" do
+        message
+        |> Map.drop([:name, "name"])
       else
         message
       end
@@ -245,12 +251,9 @@ defmodule ReqLLM.Providers.AmazonBedrock.OpenAI do
 
         _ ->
           # Create a model struct for SSE decoding
-          model_id = opts[:model] || "bedrock-openai"
+          model_id = ReqLLM.ModelId.normalize(opts[:model], "bedrock-openai")
 
-          model = %LLMDB.Model{
-            id: model_id,
-            provider: :openai
-          }
+          model = LLMDB.Model.new!(%{id: model_id, provider: :openai})
 
           # Delegate to standard OpenAI SSE event parsing
           # Event is already parsed JSON, wrap in SSE format expected by decoder

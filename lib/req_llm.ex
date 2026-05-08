@@ -70,7 +70,7 @@ defmodule ReqLLM do
       provider.generate_text(model, messages, opts)
   """
 
-  alias ReqLLM.{Embedding, Generation, Schema, Tool}
+  alias ReqLLM.{Embedding, Generation, Images, Schema, Tool}
 
   # ===========================================================================
   # Configuration API
@@ -188,22 +188,45 @@ defmodule ReqLLM do
   ## Parameters
 
     * `model_spec` - Model specification in various formats:
-      - String format: `"anthropic:claude-3-sonnet"`
+      - String format: `"anthropic:claude-3-sonnet"` (looks up in LLMDB catalog)
+      - Map format: `%{id: "my-model", provider: :my_provider}` (for custom providers)
       - Tuple format: `{:anthropic, "claude-3-sonnet", temperature: 0.7}`
       - Model struct: `%LLMDB.Model{}`
+
+  ## Custom Providers
+
+  For models not in the LLMDB catalog (custom providers), use map format:
+
+      {:ok, model} = ReqLLM.model(%{id: "acme-chat-mini", provider: :acme})
+      ReqLLM.generate_text(model, "Hello!")
+
+  This bypasses catalog lookup and creates a model struct directly.
 
   ## Examples
 
       ReqLLM.model("anthropic:claude-3-sonnet")
       #=> {:ok, %LLMDB.Model{provider: :anthropic, model: "claude-3-sonnet"}}
 
+      ReqLLM.model(%{id: "custom-model", provider: :my_provider})
+      #=> {:ok, %LLMDB.Model{provider: :my_provider, id: "custom-model"}}
+
       ReqLLM.model({:anthropic, "claude-3-sonnet", temperature: 0.5})
       #=> {:ok, %LLMDB.Model{provider: :anthropic, model: "claude-3-sonnet", temperature: 0.5}}
 
   """
-  @spec model(String.t() | {atom(), String.t(), keyword()} | {atom(), keyword()} | struct()) ::
+  @spec model(
+          String.t()
+          | map()
+          | {atom(), String.t(), keyword()}
+          | {atom(), keyword()}
+          | struct()
+        ) ::
           {:ok, struct()} | {:error, term()}
   def model(%LLMDB.Model{} = model), do: {:ok, model}
+
+  def model(%{} = attrs) when not is_struct(attrs) do
+    LLMDB.Model.new(attrs)
+  end
 
   def model({provider, model_id, _opts}) when is_atom(provider) and is_binary(model_id) do
     LLMDB.model(provider, model_id)
@@ -461,6 +484,37 @@ defmodule ReqLLM do
 
   """
   defdelegate generate_object!(model_spec, messages, schema, opts \\ []), to: Generation
+
+  # ===========================================================================
+  # Image Generation API - Delegated to ReqLLM.Images
+  # ===========================================================================
+
+  @doc """
+  Generates images using an AI model with full response metadata.
+
+  Returns a canonical `ReqLLM.Response` where images are represented as message content parts.
+  """
+  @spec generate_image(
+          String.t() | {atom(), keyword()} | struct(),
+          String.t() | list() | ReqLLM.Context.t(),
+          keyword()
+        ) :: {:ok, ReqLLM.Response.t()} | {:error, term()}
+  defdelegate generate_image(model_spec, prompt_or_messages, opts \\ []), to: Images
+
+  @doc """
+  Generates images using an AI model, raising on error.
+  """
+  @spec generate_image!(
+          String.t() | {atom(), keyword()} | struct(),
+          String.t() | list() | ReqLLM.Context.t(),
+          keyword()
+        ) :: ReqLLM.Response.t() | no_return()
+  def generate_image!(model_spec, prompt_or_messages, opts \\ []) do
+    case generate_image(model_spec, prompt_or_messages, opts) do
+      {:ok, response} -> response
+      {:error, error} -> raise error
+    end
+  end
 
   @doc """
   Streams structured data generation using an AI model with schema validation.

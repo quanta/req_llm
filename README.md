@@ -18,7 +18,7 @@ LLM APIs are inconsistent. ReqLLM provides a unified, idiomatic Elixir interface
 - **High-level API** – Vercel AI SDK-inspired functions (`generate_text/3`, `stream_text/3`, `generate_object/4` and more) that work uniformly across providers. Standard features, minimal configuration.
 - **Low-level API** – Direct Req plugin access for full HTTP control. Built around OpenAI Chat Completions baseline with provider-specific callbacks for non-compatible APIs (e.g., Anthropic).
 
-**Supported Providers:** Anthropic, OpenAI, Google, Groq, OpenRouter, xAI, AWS Bedrock, Cerebras, Meta, Z.AI, and more. See provider guides in [documentation](https://hexdocs.pm/req_llm) for details.
+**Supported Providers:** Anthropic, OpenAI, Google, Groq, OpenRouter, xAI, AWS Bedrock, Cerebras, Meta, Z.AI, Zenmux, and more. See provider guides in [documentation](https://hexdocs.pm/req_llm) for details.
 
 \* _Streaming uses Finch directly due to known Req limitations with SSE responses._
 
@@ -34,6 +34,12 @@ ReqLLM.generate_text!(model, "Hello world")
 schema = [name: [type: :string, required: true], age: [type: :pos_integer]]
 person = ReqLLM.generate_object!(model, "Generate a person", schema)
 #=> %{name: "John Doe", age: 30}
+
+{:ok, image_response} = ReqLLM.generate_image("openai:gpt-image-1", "A simple red square")
+image_bytes = ReqLLM.Response.image_data(image_response)
+File.write!("red_square.png", image_bytes)
+
+Note: Google image models gemini-2.5-flash-image and gemini-3-pro-image-preview reject :n; specify the image count in the prompt.
 
 {:ok, response} = ReqLLM.generate_text(
   model,
@@ -91,6 +97,12 @@ usage = ReqLLM.StreamResponse.usage(response)
   - Zero-copy mapping to provider JSON-schema / function-calling endpoints
   - OpenAI native structured outputs with three modes (`:auto` (default), `:json_schema`, `:tool_strict`)
 
+- **Provider-specific capabilities**
+  - Anthropic web search for real-time content access (via `provider_options: [web_search: %{max_uses: 5}]`)
+  - Extended thinking/reasoning for supported models
+  - Prompt caching for cost optimization
+  - All provider-specific options documented in provider guides
+
 - **Embedding generation**
   - Single or batch embeddings via `Embedding.generate/3` (Not all providers support this)
   - Automatic dimension / encoding validation and usage accounting
@@ -115,8 +127,8 @@ usage = ReqLLM.StreamResponse.usage(response)
   - Accepts `"provider:model"`, `{:provider, "model", opts}` tuples, or `%ReqLLM.Model{}` structs
   - Helper functions for parsing, introspection and default-merging
 
-- **Secure, layered key management** (`ReqLLM.Keys`)  
-  - Per-request override → application config → env vars / .env files  
+- **Secure, layered key management** (`ReqLLM.Keys`)
+  - Per-request override → application config → env vars / .env files
 
 - **Extensive reliability tooling**
   - Fixture-backed test matrix (`LiveFixture`) supports cached, live, or provider-filtered runs
@@ -146,6 +158,12 @@ ReqLLM.generate_text("anthropic:claude-haiku-4-5", "Hello", api_key: "sk-ant-...
 {:ok, response} = ReqLLM.stream_text("anthropic:claude-haiku-4-5", "Story", api_key: "sk-ant-...")
 ```
 
+By default, ReqLLM loads `.env` files from the current working directory at startup. To disable this behavior (e.g., if you manage environment variables yourself):
+
+```elixir
+config :req_llm, load_dotenv: false
+```
+
 ## Usage Cost Tracking
 
 Every response includes detailed usage and cost information calculated from model metadata:
@@ -164,7 +182,31 @@ response.usage
 #   }
 ```
 
+### Tool & Image Usage
+
+When using web search or generating images, additional usage metadata is available:
+
+```elixir
+# Web search usage (Anthropic, OpenAI, xAI, Google)
+{:ok, response} = ReqLLM.generate_text(model, prompt,
+  provider_options: [web_search: %{max_uses: 5}])
+
+response.usage.tool_usage
+#=> %{web_search: %{count: 2, unit: "call"}}
+
+response.usage.cost
+#=> %{tokens: 0.001, tools: 0.02, images: 0.0, total: 0.021}
+
+# Image generation usage
+{:ok, response} = ReqLLM.generate_image("openai:gpt-image-1", prompt)
+
+response.usage.image_usage
+#=> %{generated: %{count: 1, size_class: "1024x1024"}}
+```
+
 A telemetry event `[:req_llm, :token_usage]` is published on every request with token counts and calculated costs.
+
+See `lib/examples/scripts/usage_cost_search_image.exs` for a multi-provider smoke test that validates search tool and image generation cost metadata. For comprehensive documentation, see the [Usage & Billing Guide](guides/usage-and-billing.md).
 
 ## Streaming Configuration
 
@@ -284,14 +326,15 @@ This approach gives you full control over the Req pipeline, allowing you to add 
 ## Documentation
 
 - [Getting Started](guides/getting-started.md) – first call and basic concepts
+- [Configuration](guides/configuration.md) – timeouts, connection pools, and global settings
 - [Core Concepts](guides/core-concepts.md) – architecture & data model
 - [Data Structures](guides/data-structures.md) – detailed type information
+- [Usage & Billing](guides/usage-and-billing.md) – token costs, tool usage, image costs
+- [Image Generation](guides/image-generation.md) – generating images with OpenAI and Google
 - [Mix Tasks](guides/mix-tasks.md) – model sync, compatibility testing, code generation
 - [Fixture Testing](guides/fixture-testing.md) – model validation and supported models
 - [Adding a Provider](guides/adding_a_provider.md) – extend with new providers
 - Provider Guides: [Anthropic](guides/anthropic.md), [OpenAI](guides/openai.md), [Google](guides/google.md), [xAI](guides/xai.md), [Groq](guides/groq.md), [OpenRouter](guides/openrouter.md), [Amazon Bedrock](guides/amazon_bedrock.md), [Cerebras](guides/cerebras.md), [Meta](guides/meta.md), [Z.AI](guides/zai.md), [Z.AI Coder](guides/zai_coder.md)
-
-
 
 ## Roadmap & Status
 
