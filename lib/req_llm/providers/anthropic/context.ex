@@ -287,16 +287,27 @@ defmodule ReqLLM.Providers.Anthropic.Context do
   defp image_media_type?(mt) when is_binary(mt), do: String.starts_with?(mt, "image/")
   defp image_media_type?(_), do: false
 
-  defp encode_tool_call_to_tool_use(%ToolCall{id: id, function: %{name: name, arguments: args}}) do
+  defp encode_tool_call_to_tool_use(%ToolCall{
+         id: id,
+         function: %{name: name, arguments: args} = fun
+       }) do
+    build_tool_use_block(id, name, args, Map.get(fun, :caller))
+  end
+
+  defp encode_tool_call_to_tool_use(%{id: id, name: name, arguments: args} = m) do
+    build_tool_use_block(id, name, args, Map.get(m, :caller))
+  end
+
+  defp encode_tool_call_to_tool_use(%{"id" => id, "name" => name, "arguments" => args} = m) do
+    build_tool_use_block(id, name, args, Map.get(m, "caller"))
+  end
+
+  defp build_tool_use_block(id, name, args, nil) do
     %{type: "tool_use", id: id, name: name, input: decode_tool_arguments(args)}
   end
 
-  defp encode_tool_call_to_tool_use(%{id: id, name: name, arguments: args}) do
-    %{type: "tool_use", id: id, name: name, input: decode_tool_arguments(args)}
-  end
-
-  defp encode_tool_call_to_tool_use(%{"id" => id, "name" => name, "arguments" => args}) do
-    %{type: "tool_use", id: id, name: name, input: decode_tool_arguments(args)}
+  defp build_tool_use_block(id, name, args, caller) do
+    %{type: "tool_use", id: id, name: name, input: decode_tool_arguments(args), caller: caller}
   end
 
   defp decode_tool_arguments(args) when is_binary(args), do: Jason.decode!(args)
