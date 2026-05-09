@@ -158,8 +158,11 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     ReqLLM.StreamChunk.thinking(text, thinking_metadata(block))
   end
 
-  defp decode_content_block(%{"type" => "tool_use", "id" => id, "name" => name, "input" => input}) do
-    ReqLLM.StreamChunk.tool_call(name, input, %{id: id})
+  defp decode_content_block(
+         %{"type" => "tool_use", "id" => id, "name" => name, "input" => input} = block
+       ) do
+    meta = put_caller(%{id: id}, block)
+    ReqLLM.StreamChunk.tool_call(name, input, meta)
   end
 
   defp decode_content_block(%{"type" => "compaction", "content" => content}) do
@@ -239,9 +242,13 @@ defmodule ReqLLM.Providers.Anthropic.Response do
     [ReqLLM.StreamChunk.thinking(text, thinking_metadata())]
   end
 
-  defp decode_content_block_start(%{"type" => "tool_use", "id" => id, "name" => name}, index) do
+  defp decode_content_block_start(
+         %{"type" => "tool_use", "id" => id, "name" => name} = block,
+         index
+       ) do
     # Tool call start - send empty arguments that will be filled by deltas
-    [ReqLLM.StreamChunk.tool_call(name, %{}, %{id: id, index: index, start: true})]
+    meta = put_caller(%{id: id, index: index, start: true}, block)
+    [ReqLLM.StreamChunk.tool_call(name, %{}, meta)]
   end
 
   defp decode_content_block_start(%{"type" => "compaction"}, _index) do
@@ -358,10 +365,22 @@ defmodule ReqLLM.Providers.Anthropic.Response do
        }) do
     args_json = if is_binary(args), do: args, else: Jason.encode!(args)
     id = Map.get(meta, :id)
-    ReqLLM.ToolCall.new(id, name, args_json)
+    call = ReqLLM.ToolCall.new(id, name, args_json)
+
+    case Map.get(meta, :caller) do
+      nil -> call
+      caller -> %{call | function: Map.put(call.function, :caller, caller)}
+    end
   end
 
   defp chunk_to_tool_call(_), do: nil
+
+  # Preserve Anthropic's `caller` field on tool_use blocks (added when a tool is
+  # invoked from a code_execution sandbox via `allowed_callers`). Routed through
+  # StreamChunk metadata so the encoder can echo it back; without it,
+  # server_tool_use blocks become orphaned on round-trip.
+  defp put_caller(meta, %{"caller" => caller}), do: Map.put(meta, :caller, caller)
+  defp put_caller(meta, _block), do: meta
 
   defp parse_usage(%{"input_tokens" => input, "output_tokens" => output} = usage) do
     cache_read = Map.get(usage, "cache_read_input_tokens", 0)

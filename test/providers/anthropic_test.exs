@@ -1324,4 +1324,162 @@ defmodule ReqLLM.Providers.AnthropicTest do
       refute Map.has_key?(structured_tool.parameter_schema["properties"]["value"], "minimum")
     end
   end
+
+  describe "programmatic tool calling (caller field round-trip)" do
+    test "decode_response preserves caller on tool_use blocks invoked from code_execution" do
+      response_body = %{
+        "id" => "msg_01CALLER",
+        "type" => "message",
+        "role" => "assistant",
+        "model" => "claude-sonnet-4-5-20250929",
+        "content" => [
+          %{
+            "type" => "server_tool_use",
+            "id" => "srvtoolu_abc123",
+            "name" => "code_execution",
+            "input" => %{"code" => "result = await query_database('SELECT 1')\nprint(result)"}
+          },
+          %{
+            "type" => "tool_use",
+            "id" => "toolu_def456",
+            "name" => "query_database",
+            "input" => %{"sql" => "SELECT 1"},
+            "caller" => %{
+              "type" => "code_execution_20250825",
+              "tool_id" => "srvtoolu_abc123"
+            }
+          }
+        ],
+        "stop_reason" => "tool_use",
+        "usage" => %{"input_tokens" => 10, "output_tokens" => 20}
+      }
+
+      {:ok, model} = ReqLLM.model("anthropic:claude-sonnet-4-5-20250929")
+
+      {:ok, response} =
+        ReqLLM.Providers.Anthropic.Response.decode_response(response_body, model)
+
+      assert [tool_call] = response.message.tool_calls
+      assert tool_call.id == "toolu_def456"
+      assert tool_call.function.name == "query_database"
+
+      assert tool_call.function.caller == %{
+               "type" => "code_execution_20250825",
+               "tool_id" => "srvtoolu_abc123"
+             }
+    end
+
+    test "decode_response leaves caller absent on direct tool_use blocks" do
+      response_body = %{
+        "id" => "msg_01DIRECT",
+        "type" => "message",
+        "role" => "assistant",
+        "model" => "claude-sonnet-4-5-20250929",
+        "content" => [
+          %{
+            "type" => "tool_use",
+            "id" => "toolu_xyz789",
+            "name" => "get_weather",
+            "input" => %{"location" => "SF"}
+          }
+        ],
+        "stop_reason" => "tool_use",
+        "usage" => %{"input_tokens" => 5, "output_tokens" => 10}
+      }
+
+      {:ok, model} = ReqLLM.model("anthropic:claude-sonnet-4-5-20250929")
+      {:ok, response} = ReqLLM.Providers.Anthropic.Response.decode_response(response_body, model)
+
+      assert [tool_call] = response.message.tool_calls
+      refute Map.has_key?(tool_call.function, :caller)
+    end
+
+    test "encode_request emits caller on tool_use blocks when present in ToolCall.function" do
+      caller = %{"type" => "code_execution_20250825", "tool_id" => "srvtoolu_abc123"}
+
+      tool_call = %ReqLLM.ToolCall{
+        id: "toolu_def456",
+        type: "function",
+        function: %{
+          name: "query_database",
+          arguments: ~s({"sql":"SELECT 1"}),
+          caller: caller
+        }
+      }
+
+      assistant_msg = %ReqLLM.Message{
+        role: :assistant,
+        content: [],
+        tool_calls: [tool_call],
+        metadata: %{}
+      }
+
+      context = %ReqLLM.Context{
+        messages: [%ReqLLM.Message{role: :user, content: "hi", metadata: %{}}, assistant_msg]
+      }
+
+      encoded =
+        ReqLLM.Providers.Anthropic.Context.encode_request(context, %{
+          model: "claude-sonnet-4-5-20250929"
+        })
+
+      [_user, %{role: "assistant", content: blocks}] = encoded.messages
+
+      tool_use_block = Enum.find(blocks, &match?(%{type: "tool_use"}, &1))
+
+      assert tool_use_block.id == "toolu_def456"
+      assert tool_use_block.caller == caller
+    end
+
+    test "decode → encode round-trip preserves caller exactly" do
+      caller = %{"type" => "code_execution_20250825", "tool_id" => "srvtoolu_abc123"}
+
+      response_body = %{
+        "id" => "msg_01ROUND",
+        "type" => "message",
+        "role" => "assistant",
+        "model" => "claude-sonnet-4-5-20250929",
+        "content" => [
+          %{
+            "type" => "server_tool_use",
+            "id" => "srvtoolu_abc123",
+            "name" => "code_execution",
+            "input" => %{"code" => "..."}
+          },
+          %{
+            "type" => "tool_use",
+            "id" => "toolu_def456",
+            "name" => "query_database",
+            "input" => %{"sql" => "SELECT 1"},
+            "caller" => caller
+          }
+        ],
+        "stop_reason" => "tool_use",
+        "usage" => %{"input_tokens" => 10, "output_tokens" => 20}
+      }
+
+      {:ok, model} = ReqLLM.model("anthropic:claude-sonnet-4-5-20250929")
+      {:ok, response} = ReqLLM.Providers.Anthropic.Response.decode_response(response_body, model)
+
+      context = %ReqLLM.Context{
+        messages: [
+          %ReqLLM.Message{role: :user, content: "hi", metadata: %{}}
+          | response.context.messages
+        ]
+      }
+
+      encoded =
+        ReqLLM.Providers.Anthropic.Context.encode_request(context, %{
+          model: "claude-sonnet-4-5-20250929"
+        })
+
+      [_user, %{role: "assistant", content: blocks}] = encoded.messages
+
+      tool_use_block = Enum.find(blocks, &match?(%{type: "tool_use"}, &1))
+      assert tool_use_block.caller == caller
+
+      server_tool_use_block = Enum.find(blocks, &match?(%{"type" => "server_tool_use"}, &1))
+      assert server_tool_use_block["id"] == "srvtoolu_abc123"
+    end
+  end
 end
